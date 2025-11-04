@@ -1,0 +1,47 @@
+use std::time::Duration;
+use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter};
+use btleplug::platform::Manager;
+use tokio::time;
+//mod sensor;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    println!("Starting BLE scan...");
+
+    let manager = Manager::new().await?;
+    let adapters = manager.adapters().await?;
+
+    if adapters.is_empty() {
+        eprintln!("No BLE adapters found");
+        return Ok(());
+    }
+
+    let adapter = &adapters[0];
+
+    adapter.start_scan(ScanFilter::default()).await?;
+    println!("Scanning for BLE devices...");
+
+    loop {
+        let peripherals = adapter.peripherals().await?;
+        for p in peripherals {
+            let properties = p.properties().await?;
+            let address = p.address();
+            if let Some(props) = properties {
+                let name = props.local_name.unwrap_or_default();
+                let rssi = props.rssi.unwrap_or(0);
+                let manufacturer_data = props.manufacturer_data;
+                let service_data = props.service_data;
+                
+                println!("📡 Found device: {}, name={}, rssi={}", address, name, rssi);
+                for (id, data) in manufacturer_data {
+                     println!("  🏭 Manufacturer ID: {}, data: {:02X?}", id, data);
+
+                }
+                println!("  🏭 Service data: {:02X?}", service_data);
+                
+            }
+        }
+
+        time::sleep(Duration::from_secs(3)).await;
+    }
+}

@@ -1,0 +1,11 @@
+# Generated files
+/target/
+/Cargo.lock
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Cross-compilation files (custom images created by the cross tool)
+cross-custom-*
+Dockerfile.*

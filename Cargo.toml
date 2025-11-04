@@ -1,0 +1,19 @@
+[package]
+name = "mitempr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+btleplug = { version = "0.11" }
+tokio = { version = "1.48", features = ["full"] }
+uuid = { version = "1.4", features = ["v4"] }
+anyhow = "1.0"
+futures = "0.3.31"
+libdbus-sys = { version = "0.2", features = ["vendored"] } # "vendored" is needed for cross compilation!
+
+[profile.release]
+opt-level = 3
+debug = false
+codegen-units = 1
+lto = true
+strip = true
