@@ -48,6 +48,12 @@ fn get_packet_type<'a>(props: &'a PeripheralProperties) -> (BlePacketType, Optio
 // --- Public Decoding Function ---
 pub fn classify_and_decode(props: &PeripheralProperties) {
     println!("  🏭 Service Data: {:02X?}", props.service_data);
+    //for (id, data) in props.manufacturer_data.clone() {
+    //    println!("  🏭 Manufacturer ID: {}, data: {:02X?}", id, data);
+    //}
+
+    let rssi = props.rssi.unwrap_or(0);
+    println!("📡 Found device: rssi={}", rssi);
 
     let (packet_type, data_option) = get_packet_type(props);
 
@@ -55,7 +61,8 @@ pub fn classify_and_decode(props: &PeripheralProperties) {
         BlePacketType::Mijia => {
             println!("  ✅ Detected: MIJIA/LYWSDCGQ Packet");
             // We know `data_option` is `Some` here.
-            handle_lywsdcgq_packet(data_option.unwrap());
+            //handle_lywsdcgq_packet(data_option.unwrap());
+            output_sensor_data(&handle_lywsdcgq_packet(data_option.unwrap()).unwrap());
         }
         BlePacketType::BTHome => {
             println!("  ✅ Detected: BTHome");
@@ -79,13 +86,7 @@ pub fn classify_and_decode(props: &PeripheralProperties) {
     }
 }
 
-// --- Private Handler Functions (stubs for implementation) ---
-fn handle_lywsdcgq_packet(data: &Vec<u8>) {
-    // TODO: Implement your Lywsdcgq decoding logic here
-    println!("    Payload ({} bytes): {:02X?}", data.len(), data);
-    // e.g., print_lywsdcgq_data(&data);
-}
-
+// --- PVVX Decoder (Adapted from your working code) ---
 fn handle_pvvx_packet(data: &Vec<u8>) -> Result<SensorData> {
     // Expected minimal length: 6 bytes MAC + 2 bytes Temp + 2 bytes Humi + 2 bytes Volt + 1 byte Batt% + 2 bytes Counter = 15 bytes
     const MIN_LENGTH: usize = 15;
@@ -191,6 +192,95 @@ fn handle_bthome_packet(payload: &Vec<u8>) -> Option<SensorData> {
     }
 
     Some(result)
+}
+
+fn handle_lywsdcgq_packet(data: &Vec<u8>) -> Result<SensorData> {
+    // The Xiaomi Manufacturer ID (0x04C0) is already stripped by btleplug.
+    // The data slice starts with the payload length, version, etc.
+    // The byte at index 11 (in the raw slice) is the Type Identifier byte (0x0D, 0x06, 0x0A, etc.)
+    const TYPE_IDENTIFIER_OFFSET: usize = 11;
+    if data.len() < TYPE_IDENTIFIER_OFFSET + 1 { 
+        return Err(anyhow!("LYWSDCGQ V3 packet too short: {} bytes", data.len()));
+    }
+    let type_identifier = data[TYPE_IDENTIFIER_OFFSET];
+ 
+    // Initialize all fields as None
+    let mut temperature: Option<f32> = None;
+    let mut humidity: Option<f32> = None;
+    let mut battery_percent: Option<u8> = None;
+    let voltage: Option<f32> = None; // V3 typically doesn't send voltage by default
+
+    match type_identifier {
+        // 0x0D: Combined Temperature and Humidity
+        0x0D if data.len() >= 18 => {
+            
+            const TEMP_START: usize = 14; 
+            const HUMI_START: usize = 16; 
+
+            // TEMP (14-15)
+            let raw_temp_bytes: [u8; 2] = data[TEMP_START..TEMP_START+2].try_into().unwrap_or_default();
+            let raw_temp = i16::from_le_bytes(raw_temp_bytes);
+            
+            // *** FIX 1: Change / 100.0 to / 10.0 ***
+            temperature = Some(raw_temp as f32 / 10.0);
+            
+            // HUMI (16-17)
+            let raw_humi_bytes: [u8; 2] = data[HUMI_START..HUMI_START+2].try_into().unwrap_or_default();
+            let raw_humi = u16::from_le_bytes(raw_humi_bytes);
+            
+            // *** FIX 2: Change / 100.0 to / 10.0 ***
+            humidity = Some(raw_humi as f32 / 10.0);
+        }
+        
+        // 0x04: Temperature Only
+        // The packet length is 16 bytes total (indices 0 to 15)
+        0x04 if data.len() >= 16 => {
+            const TEMP_START: usize = 14; 
+
+            // TEMP (14-15)
+            let raw_temp_bytes: [u8; 2] = data[TEMP_START..TEMP_START+2].try_into().unwrap_or_default();
+            let raw_temp = i16::from_le_bytes(raw_temp_bytes);
+            
+            // Apply 0.1 precision
+            temperature = Some(raw_temp as f32 / 10.0);
+        }
+
+        // ... (You should also verify the offsets for 0x04, 0x06, and 0x0A based on this new understanding)
+        // For 0x0A (Battery, 1 byte): The data starts at index 14, not 10 or 14.
+        // The packet length for 0x0A is usually shorter (e.g., 15 bytes total)
+
+        // 0x0A: Battery Percentage Only
+        0x0A if data.len() >= 13 => { 
+            const BATT_START: usize = 14; // Must also be checked and verified
+            battery_percent = Some(data[BATT_START]);
+        }
+
+        // 0x06: Humidity Only
+        // The packet length is 16 bytes total (indices 0 to 15)
+        0x06 if data.len() >= 16 => {
+            const HUMI_START: usize = 14; 
+            
+            // HUMI (14-15)
+            let raw_humi_bytes: [u8; 2] = data[HUMI_START..HUMI_START+2].try_into().unwrap_or_default();
+            let raw_humi = u16::from_le_bytes(raw_humi_bytes); // Humidity is typically unsigned (u16)
+            
+            // Apply 0.1 precision (divide by 10.0)
+            humidity = Some(raw_humi as f32 / 10.0);
+        }
+        
+        _ => {
+            return Err(anyhow!("Unrecognized or incomplete LYWSDCGQ V3 payload (Type 0x{:02X}, Length {})", type_identifier, data.len()));
+        }
+    }
+
+    // Return the result with whichever fields were populated
+    Ok(SensorData {
+        //mac_address: mac.to_string(),
+        temperature,
+        humidity,
+        battery: battery_percent, // Assuming your struct field is named 'battery'
+        voltage,
+    })
 }
 
 // --- Output Function ---

@@ -2,7 +2,7 @@ use std::time::Duration;
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::Manager;
 use tokio::time;
-mod decoder; // This line tells Rust to look for src/decoder.rs
+mod decoder;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,21 +27,9 @@ async fn main() -> anyhow::Result<()> {
             let properties = p.properties().await?;
             let address = p.address();
             if let Some(props) = properties {
-                //let name = props.local_name.unwrap_or_default();
                 let name = props.local_name.clone().unwrap_or_default();
-                //let rssi = props.rssi.unwrap_or(0);
-                let rssi = props.rssi.clone().unwrap_or(0);
-                //let manufacturer_data = props.manufacturer_data;
-                //let service_data = props.service_data;
-                
-                println!("📡 Found device: {}, name={}, rssi={}", address, name, rssi);
-                //for (id, data) in manufacturer_data {
-                //     println!("  🏭 Manufacturer ID: {}, data: {:02X?}", id, data);
-                //}
-                //println!("  🏭 Service data: {:02X?}", &props);
-                // --- Call the external classification function ---
-                decoder::classify_and_decode(&props);
-                
+                println!("📡 Found device: {}, name={}", address, name);
+                decoder::classify_and_decode(&props);                
             }
         }
 
