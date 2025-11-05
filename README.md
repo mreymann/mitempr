@@ -2,7 +2,13 @@
 
 
 Read data from Bluetooth environmental sensors in BTHome v2, PVVX and LYWSDCGQ formats.
-Strongly inspired by  [Mitemperature2](https://github.com/JsBergbau/MiTemperature2)  and only here for learning a bit of Rust.
+Strongly inspired by  [Mitemperature2](https://github.com/JsBergbau/MiTemperature2). 
+
+## Why
+
+ - learning a bit of Rust
+ - prove how much AI can help an idiot (like me)
+ - use less resources on my poor Pi Zero W
 
 ## Status
 
