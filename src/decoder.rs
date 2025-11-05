@@ -1,5 +1,7 @@
 use btleplug::api::PeripheralProperties;
 use uuid::Uuid;
+use anyhow::{anyhow, Result};
+use std::convert::TryInto;
 //use std::collections::HashMap;
 
 #[derive(Debug)]
@@ -69,6 +71,7 @@ pub fn classify_and_decode(props: &PeripheralProperties) {
             println!("  ✅ Detected: PVVX Packet");
             // We know `data_option` is `Some` here.
             handle_pvvx_packet(data_option.unwrap());
+            output_sensor_data(&handle_pvvx_packet(data_option.unwrap()).unwrap());
         }
         BlePacketType::Other => {
             println!("  ⚠️ Detected: Other/Unclassified BLE Packet (Ignoring)");
@@ -87,10 +90,56 @@ fn handle_lywsdcgq_packet(data: &Vec<u8>) {
     // e.g., print_lywsdcgq_data(&data);
 }
 
-fn handle_pvvx_packet(data: &Vec<u8>) {
-    // TODO: Implement your Pvvx decoding logic here
-    println!("    Payload ({} bytes): {:02X?}", data.len(), data);
-    // e.g., print_lywsdcgq_data(&data);
+
+
+fn handle_pvvx_packet(data: &Vec<u8>) -> Result<SensorData> {
+    // Expected minimal length: 6 bytes MAC + 2 bytes Temp + 2 bytes Humi + 2 bytes Volt + 1 byte Batt% + 2 bytes Counter = 15 bytes
+    const MIN_LENGTH: usize = 15;
+    const MAC_LENGTH: usize = 6;
+    
+    if data.len() < MIN_LENGTH {
+        return Err(anyhow!("PVVX packet too short. Expected at least {} bytes, got {}", MIN_LENGTH, data.len()));
+    }
+    
+    // 1. MAC Check (Optional but good for validation)
+    // The first 6 bytes of the payload should be the device's MAC address, reversed.
+    // We can skip explicit MAC check for simplicity, as btleplug/bluez handles the matching.
+
+    // 2. Extract Data (Starts after the 6-byte MAC address)
+    let data_slice = &data[MAC_LENGTH..];
+    
+    // Temperature: Bytes 0 & 1 of the data_slice (data[6] and data[7])
+    // Format: Little-Endian, Signed, 0.01°C
+    let raw_temp_bytes: [u8; 2] = data_slice[0..2].try_into().unwrap_or_default();
+    let raw_temp = i16::from_le_bytes(raw_temp_bytes);
+    let temperature = raw_temp as f32 / 100.0;
+    
+    // Humidity: Bytes 2 & 3 of the data_slice (data[8] and data[9])
+    // Format: Little-Endian, Unsigned, 0.01%
+    let raw_humi_bytes: [u8; 2] = data_slice[2..4].try_into().unwrap_or_default();
+    let raw_humi = u16::from_le_bytes(raw_humi_bytes);
+    let humidity = raw_humi as f32 / 100.0;
+
+    // Battery Voltage: Bytes 4 & 5 of the data_slice (data[10] and data[11])
+    // Format: Little-Endian, Unsigned, mV
+    let raw_volt_bytes: [u8; 2] = data_slice[4..6].try_into().unwrap_or_default();
+    let raw_volt = u16::from_le_bytes(raw_volt_bytes);
+    let voltage = raw_volt as f32 / 1000.0;
+
+    // Battery Percent: Byte 6 of the data_slice (data[12])
+    let battery = data_slice[6];
+
+    // The counter (bytes 7 & 8) is often used to suppress repeated packets,
+    // but we let the calling code handle deduplication based on the full packet content
+    // or simply process all unique advertisements.
+
+    Ok(SensorData {
+        //mac_address: mac.to_string(),
+        temperature: Some(temperature),
+        humidity: Some(humidity),
+        battery: Some(battery),
+        voltage: Some(voltage),
+    })
 }
 
 // --- BTHome Decoder (Moved from your working code) ---
@@ -173,5 +222,20 @@ fn handle_bthome_packet(payload: &Vec<u8>) {
         if let Some(batt) = sensor_data.battery {
             println!("    Battery: {}%", batt);
         }
+    }
+}
+
+fn output_sensor_data(sensor_data: &SensorData) {
+    if let Some(temp) = sensor_data.temperature {
+        println!("    Temperature:  {:.2} C", temp);
+    }
+    if let Some(hum) = sensor_data.humidity {
+        println!("    Humidity:  {:.2} %", hum);
+    }
+    if let Some(volt) = sensor_data.voltage {
+        println!("    Battery voltage: {:.3} V", volt); // Use 3 decimal places for voltage
+    }
+    if let Some(batt) = sensor_data.battery {
+        println!("    Battery: {}%", batt);
     }
 }
