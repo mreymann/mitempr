@@ -1,7 +1,7 @@
 # mitempr
 
 
-Read data from Bluetooth environmental sensors in BTHome v2, PVVX and LYWSDCGQ formats.
+Read data from Bluetooth environmental sensors in BTHome v2, PVVX and LYWSDCGQ formats.  
 Strongly inspired by  [Mitemperature2](https://github.com/JsBergbau/MiTemperature2). 
 
 ## Why
@@ -21,5 +21,4 @@ Strongly inspired by  [Mitemperature2](https://github.com/JsBergbau/MiTemperatur
  - call external callback scripts
  - define sensors in a config file & filter defined sensors
  - add flags and options to binary
- - and many more stuff to fiddle with ;-)
-
+ - and many more things to fiddle with ;-)
