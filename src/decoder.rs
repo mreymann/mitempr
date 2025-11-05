@@ -21,16 +21,11 @@ pub struct SensorData {
     pub voltage: Option<f32>,
 }
 // --- Constants ---
-// Define the custom UUIDs used by Xiaomi/BTHome
+// Define the custom UUIDs used by Xiaomi/BTHome/PVVX devices
 const MIJIA_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000FE95_0000_1000_8000_00805F9B34FB);
 const BTHOME_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000FCD2_0000_1000_8000_00805F9B34FB);
 const PVVX_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000181A_0000_1000_8000_00805F9B34FB);
 const BTHOME_V2_PREAMBLE: [u8; 4] = [0x16, 0xd2, 0xfc, 0x40];
-
-// --- Helper function (from your working code) ---
-//fn print_hex(data: &[u8]) -> String {
-//    data.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
-//}
 
 // Function to check the Service Data keys and return the classification
 fn get_packet_type<'a>(props: &'a PeripheralProperties) -> (BlePacketType, Option<&'a Vec<u8>>) {
@@ -65,12 +60,13 @@ pub fn classify_and_decode(props: &PeripheralProperties) {
         BlePacketType::BTHome => {
             println!("  ✅ Detected: BTHome");
             // We know `data_option` is `Some` here.
-            handle_bthome_packet(data_option.unwrap());
+            //handle_bthome_packet(data_option.unwrap());
+            output_sensor_data(&handle_bthome_packet(data_option.unwrap()).unwrap());
         }
         BlePacketType::Pvvx => {
             println!("  ✅ Detected: PVVX Packet");
             // We know `data_option` is `Some` here.
-            handle_pvvx_packet(data_option.unwrap());
+            //handle_pvvx_packet(data_option.unwrap());
             output_sensor_data(&handle_pvvx_packet(data_option.unwrap()).unwrap());
         }
         BlePacketType::Other => {
@@ -89,8 +85,6 @@ fn handle_lywsdcgq_packet(data: &Vec<u8>) {
     println!("    Payload ({} bytes): {:02X?}", data.len(), data);
     // e.g., print_lywsdcgq_data(&data);
 }
-
-
 
 fn handle_pvvx_packet(data: &Vec<u8>) -> Result<SensorData> {
     // Expected minimal length: 6 bytes MAC + 2 bytes Temp + 2 bytes Humi + 2 bytes Volt + 1 byte Batt% + 2 bytes Counter = 15 bytes
@@ -143,9 +137,15 @@ fn handle_pvvx_packet(data: &Vec<u8>) -> Result<SensorData> {
 }
 
 // --- BTHome Decoder (Moved from your working code) ---
-// Note: This logic uses the custom Type IDs (0x01=Battery, 0x02=Temp, 0x03=Hum, 0x0C=Volt)
-fn decode_bthome_v2(data: &[u8]) -> Option<SensorData> {
-    // ... (copy the entire decode_bthome_v2 function body here)
+fn handle_bthome_packet(payload: &Vec<u8>) -> Option<SensorData> {
+    // 1. Create the full data array by prepending the preamble
+    let mut all_data = Vec::new();
+    all_data.extend_from_slice(&BTHOME_V2_PREAMBLE);
+    all_data.extend_from_slice(payload); // payload is the [40, 00, 73, 0C, ...]
+
+    // 2. The working decoder expects the full array but is sliced to skip the first 4 bytes
+    let data = &all_data[4..];
+
     let mut result = SensorData {
         temperature: None,
         humidity: None,
@@ -193,38 +193,7 @@ fn decode_bthome_v2(data: &[u8]) -> Option<SensorData> {
     Some(result)
 }
 
-// --- The Dispatch Handler ---
-fn handle_bthome_packet(payload: &Vec<u8>) {
-    // 1. Create the full data array by prepending the preamble
-    let mut all_data = Vec::new();
-    all_data.extend_from_slice(&BTHOME_V2_PREAMBLE);
-    all_data.extend_from_slice(payload); // payload is the [40, 00, 73, 0C, ...]
-
-    // 2. The working decoder expects the full array but is sliced to skip the first 4 bytes
-    let sliced_payload = &all_data[4..];
-    
-    // We don't have access to the address or RSSI here, so we print the essential data:
-    //println!("    >>> full data: {}", print_hex(&all_data));
-    //println!("    >>> stripped payload: {}", print_hex(sliced_payload));
-
-    if let Some(sensor_data) = decode_bthome_v2(sliced_payload) {
-        println!("    Decoded BTHome Data:");
-        
-        if let Some(temp) = sensor_data.temperature {
-            println!("    Temperature:  {:.2} C", temp);
-        }
-        if let Some(hum) = sensor_data.humidity {
-            println!("    Humidity:  {:.2} %", hum);
-        }
-        if let Some(volt) = sensor_data.voltage {
-            println!("    Battery voltage: {:.3} V", volt); // Use 3 decimal places for voltage
-        }
-        if let Some(batt) = sensor_data.battery {
-            println!("    Battery: {}%", batt);
-        }
-    }
-}
-
+// --- Output Function ---
 fn output_sensor_data(sensor_data: &SensorData) {
     if let Some(temp) = sensor_data.temperature {
         println!("    Temperature:  {:.2} C", temp);
