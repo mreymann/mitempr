@@ -13,9 +13,11 @@ Strongly inspired by  [Mitemperature2](https://github.com/JsBergbau/MiTemperatur
 ## Status
 
  - nicely cross compiles to armv6 (Pi Zero W), armv7 (Pi Zero W 2)
+ - nicely breaks after a while of scanning :-(
 
 ## TODOs
 
+ - getting this darn thing to be stable (#bluez)
  - reads **unencrypted** data only at the moment
  - URL callback to Prometheus Push Gateway
  - call external callback scripts
