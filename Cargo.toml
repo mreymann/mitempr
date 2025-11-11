@@ -4,12 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-btleplug = { version = "0.11" }
 tokio = { version = "1.48", features = ["full"] }
 uuid = { version = "1.4", features = ["v4"] }
 anyhow = "1.0"
-futures = "0.3.31"
 libdbus-sys = { version = "0.2", features = ["vendored"] } # "vendored" is needed for cross compilation!
+bluer = { version = "0.17", features = ["bluetoothd", "full"] }
+futures = "0.3"
+hex = "0.4" # <-- Add this for clean data printing
+clap = { version = "4", features = ["derive"] }
 
 [profile.release]
 opt-level = 3
