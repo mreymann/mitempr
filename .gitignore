@@ -1,6 +1,8 @@
 # Generated files
 /target/
 /Cargo.lock
+*.bk
+*.bak.rs
 
 # Operating system files
 .DS_Store
@@ -9,3 +11,4 @@ Thumbs.db
 # Cross-compilation files (custom images created by the cross tool)
 cross-custom-*
 Dockerfile.*
+

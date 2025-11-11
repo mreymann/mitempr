@@ -4,7 +4,7 @@ use futures::StreamExt;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::sleep;
 mod decoder;
 
@@ -150,13 +150,11 @@ async fn handle_device(adapter: &Adapter, addr: Address) -> Result<()> {
         decoder::handle_service_data(&data_map);
     }
 
-
-
-    if let Some(mdata) = device.manufacturer_data().await? {
-        for (id, data) in mdata {
-            println!("  Manufacturer {id:#06X}: {:02X?}", data);
-        }
-    }
+    //if let Some(mdata) = device.manufacturer_data().await? {
+    //    for (id, data) in mdata {
+    //        println!("  Manufacturer {id:#06X}: {:02X?}", data);
+    //    }
+    //}
 
     Ok(())
 }

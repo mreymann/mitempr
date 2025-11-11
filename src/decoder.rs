@@ -3,9 +3,9 @@ use uuid::Uuid;
 
 #[derive(Debug)]
 pub enum BlePacketType {
-    Mijia,   // 0xFE95
-    BTHome,  // 0xFCD2
-    Pvvx,    // 0x181A
+    Mijia,  // 0xFE95
+    BTHome, // 0xFCD2
+    Pvvx,   // 0x181A
     Other,
 }
 
@@ -25,22 +25,16 @@ const PVVX_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000181A_0000_1000_8000_00805F
 const BTHOME_V2_PREAMBLE: [u8; 4] = [0x16, 0xd2, 0xfc, 0x40];
 
 // Function to check the Service Data keys and return the classification
-fn get_packet_type<'a>(
-    service_data: &'a HashMap<Uuid, Vec<u8>>,
-) -> (BlePacketType, Option<&'a Vec<u8>>) {
-    // 1. Check MIJIA/LYWSDCGQ (0xFE95)
+fn get_packet_type(service_data: &HashMap<Uuid, Vec<u8>>) -> (BlePacketType, Option<&Vec<u8>>) {
     if let Some(data) = service_data.get(&MIJIA_SERVICE_UUID) {
         return (BlePacketType::Mijia, Some(data));
     }
-    // 2. Check BTHome (0xFCD2)
     if let Some(data) = service_data.get(&BTHOME_SERVICE_UUID) {
         return (BlePacketType::BTHome, Some(data));
     }
-    // 3. Check PVVX (0x181A)
     if let Some(data) = service_data.get(&PVVX_SERVICE_UUID) {
         return (BlePacketType::Pvvx, Some(data));
     }
-    // Default to Other
     (BlePacketType::Other, None)
 }
 
@@ -53,10 +47,10 @@ pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) {
 
     match packet_type {
         BlePacketType::Mijia => {
-            println!("  -> Mijia packet detected");
+            //println!("  -> Mijia packet detected");
 
             if let Some(bytes) = payload {
-                println!("  PAYLOAD: {:02X?}", bytes);
+                //println!("  PAYLOAD: {:02X?}", bytes);
 
                 match decode_mijia(bytes) {
                     Ok(decoded) => {
@@ -68,12 +62,12 @@ pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) {
                 }
             }
         }
-        
+
         BlePacketType::BTHome => {
-            println!("  -> BTHome packet detected");
+            //println!("  -> BTHome packet detected");
 
             if let Some(bytes) = payload {
-                println!("  PAYLOAD: {:02X?}", bytes);
+                //println!("  PAYLOAD: {:02X?}", bytes);
 
                 if let Some(decoded) = decode_bthome(bytes) {
                     println!("  🔍 Decoded BTHome data: {:?}", decoded);
@@ -84,10 +78,10 @@ pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) {
         }
 
         BlePacketType::Pvvx => {
-            println!("  -> PVVX packet detected");
+            //println!("  -> PVVX packet detected");
 
             if let Some(bytes) = payload {
-                println!("  PAYLOAD: {:02X?}", bytes);
+                //println!("  PAYLOAD: {:02X?}", bytes);
 
                 if let Some(decoded) = decode_pvvx(bytes) {
                     println!("  🔍 Decoded PVVX data: {:?}", decoded);
@@ -100,7 +94,6 @@ pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) {
         BlePacketType::Other => println!("  -> Unknown BLE packet"),
     }
 }
-
 
 // --- BTHome Decoder ---
 fn decode_bthome(payload: &Vec<u8>) -> Option<SensorData> {
@@ -124,31 +117,43 @@ fn decode_bthome(payload: &Vec<u8>) -> Option<SensorData> {
         if i + 1 >= data.len() {
             break;
         }
-        
+
         match data[i] {
-            0x01 => { // Battery (%) (1 byte)
-                if i + 1 >= data.len() { break; }
+            0x01 => {
+                // Battery (%) (1 byte)
+                if i + 1 >= data.len() {
+                    break;
+                }
                 result.battery = Some(data[i + 1]);
                 i += 2;
-            },
-            0x02 => { // Temperature (2 bytes, factor 0.01)
-                if i + 2 >= data.len() { break; }
+            }
+            0x02 => {
+                // Temperature (2 bytes, factor 0.01)
+                if i + 2 >= data.len() {
+                    break;
+                }
                 let temp_raw = i16::from_le_bytes([data[i + 1], data[i + 2]]);
                 result.temperature = Some(temp_raw as f32 / 100.0);
                 i += 3;
-            },
-            0x03 => { // Humidity (2 bytes, factor 0.01)
-                if i + 2 >= data.len() { break; }
+            }
+            0x03 => {
+                // Humidity (2 bytes, factor 0.01)
+                if i + 2 >= data.len() {
+                    break;
+                }
                 let hum_raw = u16::from_le_bytes([data[i + 1], data[i + 2]]);
                 result.humidity = Some(hum_raw as f32 / 100.0);
                 i += 3;
-            },
-            0x0C => { // Voltage (2 bytes, factor 0.001)
-                if i + 2 >= data.len() { break; }
+            }
+            0x0C => {
+                // Voltage (2 bytes, factor 0.001)
+                if i + 2 >= data.len() {
+                    break;
+                }
                 let voltage_raw = u16::from_le_bytes([data[i + 1], data[i + 2]]);
                 result.voltage = Some(voltage_raw as f32 / 1000.0);
                 i += 3;
-            },
+            }
             _ => {
                 //println!("  ⚠️  Unknown type 0x{:02x} at position {}", data[i], i);
                 i += 2; // Try to skip an assumed Type + 1 byte value to continue
@@ -276,8 +281,6 @@ fn decode_mijia(payload: &Vec<u8>) -> Result<SensorData, String> {
     })
 }
 
-
-
 // Unit tests for the decoder module
 #[cfg(test)]
 mod tests {
@@ -289,8 +292,10 @@ mod tests {
         let mut data = HashMap::new();
         data.insert(
             uuid!("0000fe95-0000-1000-8000-00805f9b34fb"),
-            vec![0x50, 0x20, 0xAA, 0x01, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x0D, 0x10, 0x04, 0xEA, 0x00,
-                 0x61, 0x02],
+            vec![
+                0x50, 0x20, 0xAA, 0x01, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x0D, 0x10, 0x04,
+                0xEA, 0x00, 0x61, 0x02,
+            ],
         );
 
         handle_service_data(&data);
@@ -301,18 +306,23 @@ mod tests {
         let mut data = HashMap::new();
         data.insert(
             uuid!("0000181A-0000-1000-8000-00805F9B34FB"),
-            vec![0x03, 0x7B, 0xA0, 0x38, 0xC1, 0xA4, 0xF2, 0x08, 0x19, 0x19, 0x1D, 0x09, 0x10, 0x4A, 0x05],
+            vec![
+                0x03, 0x7B, 0xA0, 0x38, 0xC1, 0xA4, 0xF2, 0x08, 0x19, 0x19, 0x1D, 0x09, 0x10, 0x4A,
+                0x05,
+            ],
         );
 
         handle_service_data(&data);
     }
-    
+
     #[test]
     fn test_bthome_service_data() {
         let mut data = HashMap::new();
         data.insert(
             uuid!("0000fcd2-0000-1000-8000-00805f9b34fb"),
-            vec![0x40, 0x00, 0x12, 0x01, 0x64, 0x02, 0x7D, 0x09, 0x03, 0x8D, 0x18],
+            vec![
+                0x40, 0x00, 0x12, 0x01, 0x64, 0x02, 0x7D, 0x09, 0x03, 0x8D, 0x18,
+            ],
         );
 
         handle_service_data(&data);
