@@ -1,24 +1,23 @@
 # mitempr
 
-
 Read data from Bluetooth environmental sensors in BTHome v2, PVVX and LYWSDCGQ formats.  
-Strongly inspired by  [Mitemperature2](https://github.com/JsBergbau/MiTemperature2). 
+Strongly inspired by [Mitemperature2](https://github.com/JsBergbau/MiTemperature2). 
 
 ## Why
 
- - learning a bit of Rust
+ - learn a bit of Rust
  - prove how much AI can help an idiot (like me)
- - use less resources on my poor Pi Zero W
+ - try to use less resources on my poor Pi Zero W
 
 ## Status
 
  - nicely cross compiles to armv6 (Pi Zero W), armv7 (Pi Zero W 2)
- - nicely breaks after a while of scanning :-(
+ - continuous scanning now works!
 
 ## TODOs
 
- - getting this darn thing to be stable (#bluez)
- - reads **unencrypted** data only at the moment
+ - get this darn thing to be more responsive (#bluez)
+ - also decode **encrypted** data
  - URL callback to Prometheus Push Gateway
  - call external callback scripts
  - define sensors in a config file & filter defined sensors

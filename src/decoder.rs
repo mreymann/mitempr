@@ -42,19 +42,16 @@ fn get_packet_type(service_data: &HashMap<Uuid, Vec<u8>>) -> (BlePacketType, Opt
 ///
 /// This function is intentionally crate-agnostic: it doesn't depend on `bluer`
 /// or any Bluetooth stack, only on standard Rust types.
-pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) {
+pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) -> Option<SensorData> {
     let (packet_type, payload) = get_packet_type(data);
 
     match packet_type {
         BlePacketType::Mijia => {
-            //println!("  -> Mijia packet detected");
-
             if let Some(bytes) = payload {
-                //println!("  PAYLOAD: {:02X?}", bytes);
-
                 match decode_mijia(bytes) {
                     Ok(decoded) => {
-                        println!("  🔍 Decoded Mijia data: {:?}", decoded);
+                        //println!("  🔍 Decoded Mijia data: {:?}", decoded);
+                        return Some(decoded);
                     }
                     Err(e) => {
                         println!("  ⚠️  Could not decode Mijia payload: {}", e);
@@ -64,13 +61,10 @@ pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) {
         }
 
         BlePacketType::BTHome => {
-            //println!("  -> BTHome packet detected");
-
             if let Some(bytes) = payload {
-                //println!("  PAYLOAD: {:02X?}", bytes);
-
                 if let Some(decoded) = decode_bthome(bytes) {
-                    println!("  🔍 Decoded BTHome data: {:?}", decoded);
+                    //println!("  🔍 Decoded BTHome data: {:?}", decoded);
+                    return Some(decoded);
                 } else {
                     println!("  ⚠️  Could not decode BTHome payload");
                 }
@@ -78,21 +72,22 @@ pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) {
         }
 
         BlePacketType::Pvvx => {
-            //println!("  -> PVVX packet detected");
-
             if let Some(bytes) = payload {
-                //println!("  PAYLOAD: {:02X?}", bytes);
-
                 if let Some(decoded) = decode_pvvx(bytes) {
-                    println!("  🔍 Decoded PVVX data: {:?}", decoded);
+                    //println!("  🔍 Decoded PVVX data: {:?}", decoded);
+                    return Some(decoded);
                 } else {
                     println!("  ⚠️  Could not decode PVVX payload");
                 }
             }
         }
 
-        BlePacketType::Other => println!("  -> Unknown BLE packet"),
+        BlePacketType::Other => {
+            println!("  -> Unknown BLE packet");
+        }
     }
+
+    None
 }
 
 // --- BTHome Decoder ---

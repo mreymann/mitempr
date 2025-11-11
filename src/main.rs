@@ -146,8 +146,9 @@ async fn handle_device(adapter: &Adapter, addr: Address) -> Result<()> {
             println!("  Service {uuid}: {:02X?}", data);
         }
 
-        // Pass by reference (no clone needed)
-        decoder::handle_service_data(&data_map);
+        if let Some(decoded) = decoder::handle_service_data(&data_map) {
+            println!("  🔍 Got sensor reading: {:?}", decoded);
+        }
     }
 
     //if let Some(mdata) = device.manufacturer_data().await? {
