@@ -1,7 +1,7 @@
 # mitempr
 
 Read data from Bluetooth environmental sensors in BTHome v2, PVVX and LYWSDCGQ formats.  
-Strongly inspired by [Mitemperature2](https://github.com/JsBergbau/MiTemperature2). 
+Strongly inspired by [Mitemperature2](https://github.com/JsBergbau/MiTemperature2). Thank you, JsBergbau!
 
 ## Why
 
@@ -19,7 +19,15 @@ Strongly inspired by [Mitemperature2](https://github.com/JsBergbau/MiTemperature
  - get this darn thing to be more responsive (#bluez)
  - also decode **encrypted** data
  - URL callback to Prometheus Push Gateway
- - call external callback scripts
+ - call external scripts
  - define sensors in a config file & filter defined sensors
  - add flags and options to binary
  - and many more things to fiddle with ;-)
+
+## Cross compiling
+
+### Pi Zero W 1
+- `cross build --release --target=arm-unknown-linux-musleabihf`
+
+### Pi Zero W 2
+- `cross build --release --target aarch64-unknown-linux-musl`

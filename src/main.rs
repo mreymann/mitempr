@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
                         evt = events.next() => {
                             match evt {
                                 Some(AdapterEvent::DeviceAdded(addr)) => {
-                                    *last_ble_packet.lock().await = Instant::now();
+                                    // ❌ no timestamp update here anymore
                                     let _ = tx.send(AdapterEvent::DeviceAdded(addr));
                                 }
                                 Some(AdapterEvent::DeviceRemoved(addr)) => {
@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
                 let mut seen = seen_devices.lock().await;
                 if !seen.contains(&addr) {
                     seen.insert(addr);
-                    if let Err(e) = handle_device(&adapter, addr).await {
+                    if let Err(e) = handle_device(&adapter, addr, last_ble_packet.clone()).await {
                         eprintln!("Error handling device {addr}: {e}");
                     }
                 }
@@ -133,7 +133,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_device(adapter: &Adapter, addr: Address) -> Result<()> {
+async fn handle_device(
+    adapter: &Adapter,
+    addr: Address,
+    last_ble_packet: Arc<Mutex<Instant>>,
+) -> Result<()> {
     let device = adapter.device(addr)?;
     let name = device.name().await?.unwrap_or_else(|| "<unknown>".into());
     let rssi = device.rssi().await?.unwrap_or(0);
@@ -141,21 +145,26 @@ async fn handle_device(adapter: &Adapter, addr: Address) -> Result<()> {
     println!("📡 {addr} ({name}), RSSI={rssi}");
 
     if let Some(data_map) = device.service_data().await? {
-        // Borrow, don’t move:
         for (uuid, data) in &data_map {
             println!("  Service {uuid}: {:02X?}", data);
         }
 
         if let Some(decoded) = decoder::handle_service_data(&data_map) {
             println!("  🔍 Got sensor reading: {:?}", decoded);
+
+            // ✅ Reset watchdog timer only on actual service data
+            *last_ble_packet.lock().await = Instant::now();
         }
     }
 
-    //if let Some(mdata) = device.manufacturer_data().await? {
-    //    for (id, data) in mdata {
-    //        println!("  Manufacturer {id:#06X}: {:02X?}", data);
-    //    }
-    //}
+    // Uncomment this if you also want manufacturer data
+    /*
+    if let Some(mdata) = device.manufacturer_data().await? {
+        for (id, data) in mdata {
+            println!("  Manufacturer {id:#06X}: {:02X?}", data);
+        }
+    }
+    */
 
     Ok(())
 }
