@@ -10,8 +10,8 @@ categories = ["command-line-utilities", "embedded"]
 
 [dependencies]
 # Only the runtime pieces actually used. "full" additionally pulls in fs, net,
-# process, signal and io-util, which cost compile time and binary size.
-tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# process and io-util, which cost compile time and binary size.
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 uuid = "1.4"
 libdbus-sys = { version = "0.2", features = ["vendored"] } # "vendored" is needed for cross compilation!
 # "bluetoothd" is the D-Bus client API this tool uses; "full" would also build
@@ -19,6 +19,16 @@ libdbus-sys = { version = "0.2", features = ["vendored"] } # "vendored" is neede
 bluer = { version = "0.17", features = ["bluetoothd"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
+log = "0.4"
+# Without default features env_logger skips its regex-based message filtering,
+# which drops the regex and aho-corasick dependencies entirely. RUST_LOG still
+# works; only filtering by message body does not.
+env_logger = { version = "0.11", default-features = false, features = [
+    "auto-color",
+    "humantime",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 opt-level = 3

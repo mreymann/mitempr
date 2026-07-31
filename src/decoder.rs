@@ -1,17 +1,43 @@
 use std::collections::HashMap;
+use std::fmt;
 use uuid::Uuid;
 
-#[derive(Debug)]
-pub enum BlePacketType {
-    Mijia,  // 0xFE95
-    BTHome, // 0xFCD2
-    Pvvx,   // 0x181A
+/// The advertisement format a sensor is broadcasting in.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum SensorFormat {
+    /// Xiaomi MiBeacon, service UUID 0xFE95.
+    MiBeacon,
+    /// BTHome v2, service UUID 0xFCD2.
+    BtHome,
+    /// PVVX custom format, service UUID 0x181A.
+    Pvvx,
+    /// Nothing this tool understands.
+    #[default]
     Other,
+}
+
+impl SensorFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MiBeacon => "mibeacon",
+            Self::BtHome => "bthome",
+            Self::Pvvx => "pvvx",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl fmt::Display for SensorFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 // --- SensorData Struct (from your working code) ---
 #[derive(Debug, Default)]
 pub struct SensorData {
+    /// Which decoder produced this reading.
+    pub format: SensorFormat,
     pub temperature: Option<f32>,
     pub humidity: Option<f32>,
     pub battery: Option<u8>,
@@ -44,68 +70,49 @@ const BTHOME_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000FCD2_0000_1000_8000_0080
 const PVVX_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000181A_0000_1000_8000_00805F9B34FB);
 
 // Function to check the Service Data keys and return the classification
-fn get_packet_type(service_data: &HashMap<Uuid, Vec<u8>>) -> (BlePacketType, Option<&[u8]>) {
+fn get_packet_type(service_data: &HashMap<Uuid, Vec<u8>>) -> (SensorFormat, Option<&[u8]>) {
     if let Some(data) = service_data.get(&MIJIA_SERVICE_UUID) {
-        return (BlePacketType::Mijia, Some(data.as_slice()));
+        return (SensorFormat::MiBeacon, Some(data.as_slice()));
     }
     if let Some(data) = service_data.get(&BTHOME_SERVICE_UUID) {
-        return (BlePacketType::BTHome, Some(data.as_slice()));
+        return (SensorFormat::BtHome, Some(data.as_slice()));
     }
     if let Some(data) = service_data.get(&PVVX_SERVICE_UUID) {
-        return (BlePacketType::Pvvx, Some(data.as_slice()));
+        return (SensorFormat::Pvvx, Some(data.as_slice()));
     }
-    (BlePacketType::Other, None)
+    (SensorFormat::Other, None)
 }
 
-/// Decode or print service data from BLE advertisements.
+/// Decode service data from a BLE advertisement.
 ///
 /// This function is intentionally crate-agnostic: it doesn't depend on `bluer`
 /// or any Bluetooth stack, only on standard Rust types.
+///
+/// Decode failures are logged at debug level, not warn: a sensor broadcasts
+/// several times a minute, so a payload this tool cannot read would otherwise
+/// repeat the same warning forever.
 pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) -> Option<SensorData> {
-    let (packet_type, payload) = get_packet_type(data);
+    let (format, payload) = get_packet_type(data);
+    let payload = payload?;
 
-    match packet_type {
-        BlePacketType::Mijia => {
-            if let Some(bytes) = payload {
-                match decode_mijia(bytes) {
-                    Ok(decoded) => {
-                        //println!("  🔍 Decoded Mijia data: {:?}", decoded);
-                        return Some(decoded);
-                    }
-                    Err(e) => {
-                        println!("  ⚠️  Could not decode Mijia payload: {e}");
-                    }
-                }
-            }
-        }
+    match format {
+        SensorFormat::MiBeacon => match decode_mijia(payload) {
+            Ok(decoded) => return Some(decoded),
+            Err(e) => log::debug!("could not decode MiBeacon payload: {e}"),
+        },
 
-        BlePacketType::BTHome => {
-            if let Some(bytes) = payload {
-                if let Some(decoded) = decode_bthome(bytes) {
-                    //println!("  🔍 Decoded BTHome data: {:?}", decoded);
-                    return Some(decoded);
-                } else {
-                    println!("  ⚠️  Could not decode BTHome payload");
-                }
-            }
-        }
+        SensorFormat::BtHome => match decode_bthome(payload) {
+            Some(decoded) => return Some(decoded),
+            None => log::debug!("could not decode BTHome payload"),
+        },
 
-        BlePacketType::Pvvx => {
-            if let Some(bytes) = payload {
-                if let Some(decoded) = decode_pvvx(bytes) {
-                    //println!("  🔍 Decoded PVVX data: {:?}", decoded);
-                    return Some(decoded);
-                } else {
-                    println!("  ⚠️  Could not decode PVVX payload");
-                }
-            }
-        }
+        SensorFormat::Pvvx => match decode_pvvx(payload) {
+            Some(decoded) => return Some(decoded),
+            None => log::debug!("could not decode PVVX payload"),
+        },
 
-        BlePacketType::Other => {
-            // Every phone, watch and TV in range lands here. Now that each
-            // advertisement is processed rather than only the first one per
-            // device, saying so on every packet drowns out the readings.
-        }
+        // Every phone, watch and TV in range lands here.
+        SensorFormat::Other => {}
     }
 
     None
@@ -180,8 +187,8 @@ fn decode_bthome(payload: &[u8]) -> Option<SensorData> {
     let info = BthomeDeviceInfo::parse(info_byte);
 
     if info.version != 2 {
-        println!(
-            "  [!] BTHome v{} is not supported (device info 0x{info_byte:02X})",
+        log::debug!(
+            "BTHome v{} is not supported (device info 0x{info_byte:02X})",
             info.version
         );
         return None;
@@ -190,23 +197,26 @@ fn decode_bthome(payload: &[u8]) -> Option<SensorData> {
     if info.encrypted {
         // Reading the ciphertext as if it were objects yields plausible-looking
         // nonsense, so refuse instead of inventing measurements.
-        println!("  [!] BTHome payload is encrypted and no bind key is configured");
+        log::debug!("BTHome payload is encrypted and no bind key is configured");
         return None;
     }
 
-    let mut result = SensorData::default();
+    let mut result = SensorData {
+        format: SensorFormat::BtHome,
+        ..Default::default()
+    };
 
     while let Some((&object_id, tail)) = rest.split_first() {
         let Some(len) = bthome_value_len(object_id, tail) else {
-            println!(
-                "  [!] Unknown BTHome object id 0x{object_id:02X}; stopping here rather than \
-                 guessing its length"
+            log::debug!(
+                "unknown BTHome object id 0x{object_id:02X}; stopping here rather than guessing \
+                 its length"
             );
             break;
         };
 
         if tail.len() < len {
-            println!("  [!] Truncated BTHome object 0x{object_id:02X}");
+            log::debug!("truncated BTHome object 0x{object_id:02X}");
             break;
         }
 
@@ -294,6 +304,7 @@ fn decode_pvvx(payload: &[u8]) -> Option<SensorData> {
     };
 
     Some(SensorData {
+        format: SensorFormat::Pvvx,
         temperature,
         humidity,
         battery,
@@ -379,7 +390,10 @@ fn decode_mijia(payload: &[u8]) -> Result<SensorData, String> {
         .get(offset..)
         .ok_or("frame ends before the first data object")?;
 
-    let mut result = SensorData::default();
+    let mut result = SensorData {
+        format: SensorFormat::MiBeacon,
+        ..Default::default()
+    };
 
     // Each object is a little-endian u16 id, a length byte, then that many value
     // bytes. Because the length is explicit, an object this decoder does not
