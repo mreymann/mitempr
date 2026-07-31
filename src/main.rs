@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod config;
+mod crypto;
 mod decoder;
 mod exec;
 mod metrics;

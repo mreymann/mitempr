@@ -1,7 +1,7 @@
 //! Continuous BLE discovery with a watchdog that restarts a wedged scan.
 
 use crate::config::Config;
-use crate::decoder;
+use crate::decoder::{self, DecodeOptions};
 use crate::exec::Hook;
 use crate::metrics::Registry;
 use crate::output::{Format, Reading};
@@ -201,10 +201,18 @@ async fn handle_device(
         }
     }
 
-    if let Some(mut data) = decoder::handle_service_data(&service_data) {
+    // Looked up before decoding, because an encrypted advertisement cannot be
+    // read at all without this sensor's bind key.
+    let sensor = settings.config.settings(addr);
+    let options = DecodeOptions {
+        mac: *addr,
+        bindkey: sensor.and_then(|sensor| sensor.bindkey.as_ref()),
+    };
+
+    if let Some(mut data) = decoder::handle_service_data(&service_data, options) {
         // A configured name beats whatever the device calls itself, and the
         // calibration offsets are applied before anything sees the reading.
-        if let Some(sensor) = settings.config.settings(addr) {
+        if let Some(sensor) = sensor {
             sensor.calibrate(&mut data);
             if sensor.name.is_some() {
                 name = sensor.name.clone();

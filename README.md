@@ -64,6 +64,7 @@ mac = "A4:C1:38:00:11:22"
 name = "Living Room"
 temperature_offset = -0.3   # added to every reading from this sensor
 humidity_offset = 1.5
+bindkey = "231d..."         # only for sensors that encrypt (see below)
 ```
 
 A configured `name` replaces the advertised one, so readings are labelled the
@@ -138,9 +139,30 @@ choose the job name or add grouping labels. Plain HTTP only — there is no TLS
 client here, so put a reverse proxy in front of it or use scraping instead. A
 Pushgateway that is down is logged and retried, never fatal.
 
+## Encrypted sensors
+
+BTHome v2 and MiBeacon can both encrypt their advertisements with AES-CCM and a
+per-device bind key. Give the key in the sensor's config block and the
+advertisement is decrypted before it is decoded:
+
+```toml
+[[sensor]]
+mac = "A4:C1:38:00:11:22"
+bindkey = "231d39c1d7cc1ab1aee224cd096db932"
+```
+
+The key is 32 hex characters. BTHome devices print theirs when you set one;
+Xiaomi keys come out of the Mi Home account, which is what tools like
+[Xiaomi-cloud-tokens-extractor](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor)
+are for.
+
+Without a key an encrypted advertisement is skipped with a message rather than
+parsed as if it were plaintext — ciphertext read as plaintext produces
+believable-looking nonsense. A wrong key fails the packet's MIC check, which is
+also reported rather than guessed at.
+
 ## TODOs
 
- - also decode **encrypted** data
  - and many more things to fiddle with ;-)
 
 ## Cross compiling
