@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::decoder;
 use crate::exec::Hook;
+use crate::metrics::Registry;
 use crate::output::{Format, Reading};
 use bluer::{Adapter, AdapterEvent, Address, DeviceProperty, Result};
 use futures::StreamExt;
@@ -32,6 +33,8 @@ pub struct Settings {
     pub config: Config,
     /// External program to run per reading, if any.
     pub exec: Option<Hook>,
+    /// Where readings are accumulated for Prometheus, if enabled.
+    pub metrics: Option<Arc<Registry>>,
 }
 
 /// Scan until the adapter disappears or the task is cancelled.
@@ -210,6 +213,10 @@ async fn handle_device(
 
         let reading = Reading::new(addr, name, rssi, &data);
         reading.emit(settings.format);
+
+        if let Some(registry) = &settings.metrics {
+            registry.record(&reading);
+        }
 
         if let Some(hook) = &settings.exec {
             hook.run(&reading);

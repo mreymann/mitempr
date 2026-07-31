@@ -18,6 +18,8 @@ tokio = { version = "1.48", features = [
     "time",
     "signal",
     "process",
+    "net",
+    "io-util",
 ] }
 uuid = "1.4"
 libdbus-sys = { version = "0.2", features = ["vendored"] } # "vendored" is needed for cross compilation!

@@ -19,6 +19,7 @@ Strongly inspired by [Mitemperature2](https://github.com/JsBergbau/MiTemperature
 ```
 mitempr [--config PATH] [--only-known] [--min-rssi DBM]
         [--exec PATH] [--exec-interval SECS]
+        [--metrics-addr ADDR] [--pushgateway-url URL] [--push-interval SECS]
         [--format text|json] [-v|-vv] [-q]
         [--watchdog SECS] [--cooldown SECS]
 ```
@@ -102,10 +103,44 @@ warning — a backlog of stale temperatures is worse than a gap.
 The script's stdout goes to `/dev/null` so a chatty script cannot corrupt
 `--format json`; its stderr is left alone so you can see it complain.
 
+## Prometheus
+
+Two ways to get the readings into Prometheus.
+
+**Scraping** (`--metrics-addr 0.0.0.0:9184`) serves `/metrics`:
+
+```console
+$ curl -s localhost:9184/metrics
+# HELP mitempr_temperature_celsius Last temperature reported by the sensor, in degrees Celsius.
+# TYPE mitempr_temperature_celsius gauge
+mitempr_temperature_celsius{mac="A4:C1:38:A0:7B:03",name="Living Room",format="pvvx"} 22.5
+```
+
+Exported per sensor: `mitempr_temperature_celsius`, `mitempr_humidity_percent`,
+`mitempr_pressure_hpa`, `mitempr_illuminance_lux`, `mitempr_moisture_percent`,
+`mitempr_battery_percent`, `mitempr_battery_volts`, `mitempr_rssi_dbm`,
+`mitempr_last_seen_timestamp_seconds` and the counter
+`mitempr_readings_total`. Only measurements a sensor actually reports get a
+series.
+
+A gauge keeps its last value, so use `mitempr_last_seen_timestamp_seconds` to
+tell a quiet sensor from a fresh one:
+
+```promql
+time() - mitempr_last_seen_timestamp_seconds > 600
+```
+
+**Pushing** (`--pushgateway-url http://gateway:9091`) POSTs the same text every
+`--push-interval` seconds (30 by default), which is what you want when the Pi
+cannot be reached from the Prometheus server. The URL defaults to job
+`mitempr`; spell out the path (`http://gateway:9091/metrics/job/attic`) to
+choose the job name or add grouping labels. Plain HTTP only — there is no TLS
+client here, so put a reverse proxy in front of it or use scraping instead. A
+Pushgateway that is down is logged and retried, never fatal.
+
 ## TODOs
 
  - also decode **encrypted** data
- - URL callback to Prometheus Push Gateway
  - and many more things to fiddle with ;-)
 
 ## Cross compiling

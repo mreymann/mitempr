@@ -1,16 +1,20 @@
 use clap::Parser;
 use log::LevelFilter;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 mod config;
 mod decoder;
 mod exec;
+mod metrics;
 mod output;
 mod scan;
 
 use config::Config;
 use exec::Hook;
+use metrics::{PushTarget, Registry};
 use output::Format;
 
 /// Read environmental data from Bluetooth sensors.
@@ -37,6 +41,24 @@ struct Args {
     /// Shortest gap in seconds between two --exec runs for the same sensor
     #[arg(long, value_name = "SECS", default_value_t = 0, requires = "exec")]
     exec_interval: u64,
+
+    /// Serve Prometheus metrics on this address, e.g. 0.0.0.0:9184
+    #[arg(long, value_name = "ADDR")]
+    metrics_addr: Option<SocketAddr>,
+
+    /// Also push the same metrics to a Prometheus Pushgateway, e.g.
+    /// http://gateway:9091 (plain HTTP only)
+    #[arg(long, value_name = "URL")]
+    pushgateway_url: Option<String>,
+
+    /// How often to push to the Pushgateway, in seconds
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = 30,
+        requires = "pushgateway_url"
+    )]
+    push_interval: u64,
 
     /// Restart discovery if no reading arrives for this many seconds
     #[arg(long, default_value_t = 20)]
@@ -121,6 +143,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.cooldown
     );
 
+    // One registry shared by the scan loop, the /metrics endpoint and the
+    // Pushgateway loop; only built when something actually wants it.
+    let registry = (args.metrics_addr.is_some() || args.pushgateway_url.is_some())
+        .then(|| Arc::new(Registry::new()));
+
+    if let Some(addr) = args.metrics_addr {
+        let registry = Arc::clone(
+            registry
+                .as_ref()
+                .expect("registry exists with --metrics-addr"),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = metrics::serve(addr, registry).await {
+                log::error!("metrics endpoint stopped: {e}");
+            }
+        });
+    }
+
+    if let Some(url) = &args.pushgateway_url {
+        let target = PushTarget::parse(url)?;
+        let registry = Arc::clone(
+            registry
+                .as_ref()
+                .expect("registry exists with --pushgateway-url"),
+        );
+        let interval = Duration::from_secs(args.push_interval.max(1));
+        tokio::spawn(metrics::push_periodically(target, registry, interval));
+    }
+
     let settings = scan::Settings {
         watchdog: Duration::from_secs(args.watchdog),
         cooldown: Duration::from_secs(args.cooldown),
@@ -130,6 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .exec
             .clone()
             .map(|program| Hook::new(program, Duration::from_secs(args.exec_interval))),
+        metrics: registry,
     };
 
     tokio::select! {
