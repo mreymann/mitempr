@@ -300,69 +300,138 @@ fn decode_pvvx(payload: &[u8]) -> Option<SensorData> {
     })
 }
 
-// --- LYWSDCGQ V3 Decoder ---
+// --- Xiaomi MiBeacon Decoder (LYWSDCGQ and friends) ---
+
+/// The MiBeacon frame-control field: the first two bytes of the service data,
+/// little-endian.
+///
+/// Only the bits that affect parsing are kept. Bit numbering follows the
+/// MiBeacon specification, cross-checked against
+/// <https://github.com/Bluetooth-Devices/xiaomi-ble>.
+struct MibeaconFrameControl {
+    /// Bit 3: the data objects are AES-CCM encrypted.
+    encrypted: bool,
+    /// Bit 4: the sender's MAC address is part of the frame.
+    mac_included: bool,
+    /// Bit 5: a capability byte follows the MAC.
+    capability_included: bool,
+    /// Bit 6: the frame carries at least one data object.
+    object_included: bool,
+}
+
+impl MibeaconFrameControl {
+    fn parse(bytes: [u8; 2]) -> Self {
+        let bits = u16::from_le_bytes(bytes);
+        Self {
+            encrypted: bits & (1 << 3) != 0,
+            mac_included: bits & (1 << 4) != 0,
+            capability_included: bits & (1 << 5) != 0,
+            object_included: bits & (1 << 6) != 0,
+        }
+    }
+}
+
+/// Frame control (2) + product id (2) + frame counter (1).
+const MIBEACON_HEADER_LEN: usize = 5;
+const MIBEACON_MAC_LEN: usize = 6;
+/// Bit 5 of the capability byte announces an extra IO-capability byte.
+const MIBEACON_CAPABILITY_IO: u8 = 0x20;
+
 fn decode_mijia(payload: &[u8]) -> Result<SensorData, String> {
-    // The Xiaomi Manufacturer ID (0x04C0) is already stripped by bluer.
-    // The byte at index 11 is the Type Identifier byte (0x0D, 0x06, 0x0A, etc.)
-    const TYPE_IDENTIFIER_OFFSET: usize = 11;
-
-    if payload.len() <= TYPE_IDENTIFIER_OFFSET {
-        return Err(format!(
-            "LYWSDCGQ V3 packet too short: {} bytes",
-            payload.len()
-        ));
+    if payload.len() < MIBEACON_HEADER_LEN {
+        return Err(format!("MiBeacon frame too short: {} bytes", payload.len()));
     }
 
-    let type_identifier = payload[TYPE_IDENTIFIER_OFFSET];
+    let frame_control = MibeaconFrameControl::parse([payload[0], payload[1]]);
 
-    // Initialize all fields as None
-    let mut temperature: Option<f32> = None;
-    let mut humidity: Option<f32> = None;
-    let mut battery_percent: Option<u8> = None;
-    let voltage: Option<f32> = None; // V3 typically doesn't send voltage
+    if frame_control.encrypted {
+        // The objects are ciphertext. Parsing them as plaintext produces
+        // believable-looking rubbish, so refuse rather than invent readings.
+        return Err("frame is encrypted and no bind key is configured".to_string());
+    }
 
-    match type_identifier {
-        // 0x0D: Combined Temperature and Humidity
-        0x0D if payload.len() >= 18 => {
-            let raw_temp_bytes: [u8; 2] = payload[14..16].try_into().unwrap_or([0, 0]);
-            temperature = Some(i16::from_le_bytes(raw_temp_bytes) as f32 / 10.0);
+    if !frame_control.object_included {
+        return Err("frame carries no data object".to_string());
+    }
 
-            let raw_humi_bytes: [u8; 2] = payload[16..18].try_into().unwrap_or([0, 0]);
-            humidity = Some(u16::from_le_bytes(raw_humi_bytes) as f32 / 10.0);
+    // The header is followed by an optional MAC address and an optional
+    // capability byte, so the offset of the first data object depends on the
+    // frame-control bits rather than being a fixed constant.
+    let mut offset = MIBEACON_HEADER_LEN;
+
+    if frame_control.mac_included {
+        offset += MIBEACON_MAC_LEN;
+    }
+
+    if frame_control.capability_included {
+        let capability = *payload
+            .get(offset)
+            .ok_or("frame ends before the capability byte")?;
+        offset += 1;
+        if capability & MIBEACON_CAPABILITY_IO != 0 {
+            offset += 1;
         }
+    }
 
-        // 0x04: Temperature Only
-        0x04 if payload.len() >= 16 => {
-            let raw_temp_bytes: [u8; 2] = payload[14..16].try_into().unwrap_or([0, 0]);
-            temperature = Some(i16::from_le_bytes(raw_temp_bytes) as f32 / 10.0);
-        }
+    let mut objects = payload
+        .get(offset..)
+        .ok_or("frame ends before the first data object")?;
 
-        // 0x06: Humidity Only
-        0x06 if payload.len() >= 16 => {
-            let raw_humi_bytes: [u8; 2] = payload[14..16].try_into().unwrap_or([0, 0]);
-            humidity = Some(u16::from_le_bytes(raw_humi_bytes) as f32 / 10.0);
-        }
+    let mut result = SensorData::default();
 
-        // 0x0A: Battery Percentage Only
-        0x0A if payload.len() >= 15 => {
-            battery_percent = Some(payload[14]);
-        }
+    // Each object is a little-endian u16 id, a length byte, then that many value
+    // bytes. Because the length is explicit, an object this decoder does not
+    // know about can be skipped without losing the ones after it.
+    while objects.len() >= 3 {
+        let event_id = u16::from_le_bytes([objects[0], objects[1]]);
+        let value_len = usize::from(objects[2]);
 
-        _ => {
+        let Some(value) = objects.get(3..3 + value_len) else {
             return Err(format!(
-                "Unrecognized or incomplete LYWSDCGQ V3 payload (Type 0x{type_identifier:02X}, Length {})",
-                payload.len()
+                "truncated MiBeacon object 0x{event_id:04X}: {value_len} value bytes announced, \
+                 {} available",
+                objects.len() - 3
             ));
+        };
+        objects = &objects[3 + value_len..];
+
+        match (event_id, value) {
+            // Temperature, signed, factor 0.1
+            (0x1004, &[lo, hi]) => {
+                result.temperature = Some(f32::from(i16::from_le_bytes([lo, hi])) / 10.0);
+            }
+            // Humidity, factor 0.1
+            (0x1006, &[lo, hi]) => {
+                result.humidity = Some(f32::from(u16::from_le_bytes([lo, hi])) / 10.0);
+            }
+            // Illuminance in lux
+            (0x1007, &[a, b, c]) => {
+                result.illuminance = Some(u24_le(&[a, b, c]) as f32);
+            }
+            // Moisture in percent
+            (0x1008, &[percent]) => {
+                result.moisture = Some(f32::from(percent));
+            }
+            // Battery in percent
+            (0x100A, &[percent]) => {
+                result.battery = Some(percent);
+            }
+            // Temperature and humidity in one object
+            (0x100D, &[t_lo, t_hi, h_lo, h_hi]) => {
+                result.temperature = Some(f32::from(i16::from_le_bytes([t_lo, t_hi])) / 10.0);
+                result.humidity = Some(f32::from(u16::from_le_bytes([h_lo, h_hi])) / 10.0);
+            }
+            // Skipped by its announced length: door/lock/button events, remaining
+            // battery of consumables, formaldehyde, ...
+            _ => {}
         }
     }
 
-    Ok(SensorData {
-        temperature,
-        humidity,
-        battery: battery_percent,
-        voltage,
-        ..Default::default()
-    })
+    if result.is_empty() {
+        return Err("no known MiBeacon object in frame".to_string());
+    }
+
+    Ok(result)
 }
 
 // Unit tests for the decoder module
@@ -713,10 +782,10 @@ mod tests {
     /// 23.4 degC / 60.9 % reading as
     /// `mijia_decodes_combined_temperature_and_humidity`, shifted one byte.
     ///
-    /// Currently the event offset is the hardcoded constant 11, so the decoder
-    /// reads the capability byte as the event id and gives up.
+    /// Before the offset was derived from the frame-control bits it was the
+    /// constant 11, so the decoder read the capability byte as the event id and
+    /// gave up.
     #[test]
-    #[ignore = "known bug: the event offset is hardcoded to 11 instead of derived from the frame-control bits"]
     fn mijia_decodes_frame_with_capability_byte() {
         let data = advertisement(
             MIJIA_UUID,
@@ -734,7 +803,6 @@ mod tests {
     /// Frame control 0x2040 clears bit 4, so no MAC is included and the event
     /// starts six bytes earlier.
     #[test]
-    #[ignore = "known bug: the event offset assumes the MAC-included frame-control bit is always set"]
     fn mijia_decodes_frame_without_mac_address() {
         let data = advertisement(
             MIJIA_UUID,
@@ -751,7 +819,6 @@ mod tests {
     /// Frame control 0x2058 sets bit 3, marking the event payload as encrypted.
     /// Without a bind key it must not be read as plaintext.
     #[test]
-    #[ignore = "known bug: the frame-control encryption bit is never checked"]
     fn mijia_encrypted_payload_is_not_decoded_as_plaintext() {
         let data = advertisement(
             MIJIA_UUID,
@@ -765,6 +832,119 @@ mod tests {
             handle_service_data(&data).is_none(),
             "an encrypted payload must not yield a plaintext reading"
         );
+    }
+
+    /// Capability byte 0x28 sets bit 5, which announces one further
+    /// IO-capability byte before the first event.
+    #[test]
+    fn mijia_decodes_frame_with_io_capability() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x70, 0x20, 0xAA, 0x01, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x28, 0x00, 0x0D,
+                0x10, 0x04, 0xEA, 0x00, 0x61, 0x02,
+            ],
+        );
+
+        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        assert_measurement(reading.temperature, 23.4);
+        assert_measurement(reading.humidity, 60.9);
+    }
+
+    /// Frame control 0x2010 clears bit 6, so the frame carries no data object at
+    /// all -- it is a bare advertisement, not a reading.
+    #[test]
+    fn mijia_rejects_frame_without_the_object_bit() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x10, 0x20, 0xAA, 0x01, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x0D, 0x10, 0x04,
+                0xEA, 0x00, 0x61, 0x02,
+            ],
+        );
+
+        assert!(handle_service_data(&data).is_none());
+    }
+
+    /// A frame may carry several objects in a row. Here a battery event is
+    /// followed by a combined temperature/humidity event.
+    #[test]
+    fn mijia_decodes_multiple_objects_in_one_frame() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x50, 0x20, 0xAA, 0x01, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x0A, 0x10, 0x01,
+                0x5B, 0x0D, 0x10, 0x04, 0xEA, 0x00, 0x61, 0x02,
+            ],
+        );
+
+        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        assert_eq!(reading.battery, Some(91));
+        assert_measurement(reading.temperature, 23.4);
+        assert_measurement(reading.humidity, 60.9);
+    }
+
+    /// An event this decoder does not report is skipped by its announced length,
+    /// so the event after it is still found. Here an unknown 2-byte object sits
+    /// in front of the temperature/humidity event.
+    #[test]
+    fn mijia_skips_unknown_objects_without_losing_the_rest() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x50, 0x20, 0xAA, 0x01, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x99, 0x10, 0x02,
+                0xAA, 0xBB, 0x0D, 0x10, 0x04, 0xEA, 0x00, 0x61, 0x02,
+            ],
+        );
+
+        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        assert_measurement(reading.temperature, 23.4);
+        assert_measurement(reading.humidity, 60.9);
+    }
+
+    /// An object that announces more value bytes than the frame contains is
+    /// rejected rather than read out of bounds.
+    #[test]
+    fn mijia_rejects_a_truncated_object() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x50, 0x20, 0xAA, 0x01, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x0D, 0x10, 0x04,
+                0xEA, 0x00,
+            ],
+        );
+
+        assert!(handle_service_data(&data).is_none());
+    }
+
+    /// Illuminance event 0x1007: 0x0001F4 = 500 lux.
+    #[test]
+    fn mijia_decodes_illuminance_event() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x50, 0x20, 0x98, 0x00, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x07, 0x10, 0x03,
+                0xF4, 0x01, 0x00,
+            ],
+        );
+
+        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        assert_measurement(reading.illuminance, 500.0);
+    }
+
+    /// Moisture event 0x1008 carries a percentage in a single byte.
+    #[test]
+    fn mijia_decodes_moisture_event() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x50, 0x20, 0x98, 0x00, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x08, 0x10, 0x01,
+                0x1C,
+            ],
+        );
+
+        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        assert_measurement(reading.moisture, 28.0);
     }
 
     // --- Dispatch ---
