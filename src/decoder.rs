@@ -282,44 +282,331 @@ mod tests {
     use super::*;
     use uuid::uuid;
 
+    const MIJIA_UUID: Uuid = uuid!("0000fe95-0000-1000-8000-00805f9b34fb");
+    const BTHOME_UUID: Uuid = uuid!("0000fcd2-0000-1000-8000-00805f9b34fb");
+    const PVVX_UUID: Uuid = uuid!("0000181a-0000-1000-8000-00805f9b34fb");
+
+    /// Wrap a single service-data payload the way BlueZ hands it to us.
+    fn advertisement(uuid: Uuid, payload: &[u8]) -> HashMap<Uuid, Vec<u8>> {
+        let mut map = HashMap::new();
+        map.insert(uuid, payload.to_vec());
+        map
+    }
+
+    /// Compare a decoded measurement against its expected value. The decoders
+    /// divide integers by 10/100/1000, so an exact `==` would be fragile.
+    #[track_caller]
+    fn assert_measurement(actual: Option<f32>, expected: f32) {
+        let value = actual.expect("expected a measurement, got None");
+        assert!(
+            (value - expected).abs() < 0.0005,
+            "expected {expected}, got {value}"
+        );
+    }
+
+    // --- BTHome v2 ---
+
+    /// Device info 0x40 (v2, unencrypted), packet id 0x12, battery 100 %,
+    /// temperature 0x097D = 2429 -> 24.29 degC, humidity 0x188D = 6285 -> 62.85 %.
     #[test]
-    fn test_mijia_service_data() {
-        let mut data = HashMap::new();
-        data.insert(
-            uuid!("0000fe95-0000-1000-8000-00805f9b34fb"),
-            vec![
-                0x50, 0x20, 0xAA, 0x01, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x0D, 0x10, 0x04,
-                0xEA, 0x00, 0x61, 0x02,
+    fn bthome_decodes_battery_temperature_and_humidity() {
+        let data = advertisement(
+            BTHOME_UUID,
+            &[
+                0x40, 0x00, 0x12, 0x01, 0x64, 0x02, 0x7D, 0x09, 0x03, 0x8D, 0x18,
             ],
         );
 
-        handle_service_data(&data);
+        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        assert_eq!(reading.battery, Some(100));
+        assert_measurement(reading.temperature, 24.29);
+        assert_measurement(reading.humidity, 62.85);
+        assert_eq!(reading.voltage, None);
     }
 
+    /// Voltage object 0x0C: 0x0B9E = 2974 -> 2.974 V.
     #[test]
-    fn test_pvvx_service_data() {
-        let mut data = HashMap::new();
-        data.insert(
-            uuid!("0000181A-0000-1000-8000-00805F9B34FB"),
-            vec![
+    fn bthome_decodes_voltage() {
+        let data = advertisement(BTHOME_UUID, &[0x40, 0x00, 0x01, 0x0C, 0x9E, 0x0B]);
+
+        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        assert_measurement(reading.voltage, 2.974);
+        assert_eq!(reading.temperature, None);
+        assert_eq!(reading.humidity, None);
+    }
+
+    /// A three-byte object (illuminance, 0x05) followed by a temperature.
+    ///
+    /// Illuminance 0x0003E8 = 1000 -> 10.00 lux, then 0x097D = 2429 -> 24.29 degC.
+    ///
+    /// Currently the unknown-object fallback advances the cursor by a guessed two
+    /// bytes, so it lands mid-value: byte 0x03 is mistaken for a humidity object
+    /// and the parser reports humidity 5.12 % while dropping the temperature
+    /// entirely. Ignored until the object-length table lands.
+    #[test]
+    #[ignore = "known bug: unknown object IDs advance the cursor by a guessed 2 bytes, which desyncs the parser on 3-byte objects"]
+    fn bthome_three_byte_object_does_not_desync_the_parser() {
+        let data = advertisement(
+            BTHOME_UUID,
+            &[0x40, 0x05, 0xE8, 0x03, 0x00, 0x02, 0x7D, 0x09],
+        );
+
+        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        assert_measurement(reading.temperature, 24.29);
+        assert_eq!(
+            reading.humidity, None,
+            "this packet carries no humidity object"
+        );
+    }
+
+    /// Device info 0x41 sets bit 0, marking the payload as encrypted. Without a
+    /// bind key nothing here can be decoded, and the ciphertext must not be
+    /// parsed as if it were plaintext objects.
+    ///
+    /// Currently the device-info byte is skipped unread, so the first ciphertext
+    /// bytes are happily interpreted as a temperature object.
+    #[test]
+    #[ignore = "known bug: the device-info byte is never parsed, so the encryption flag is ignored"]
+    fn bthome_encrypted_payload_is_not_decoded_as_plaintext() {
+        let data = advertisement(
+            BTHOME_UUID,
+            &[
+                0x41, 0x02, 0x7D, 0x09, 0x03, 0x8D, 0x18, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                0x88,
+            ],
+        );
+
+        assert!(
+            handle_service_data(&data).is_none(),
+            "an encrypted payload must not yield a plaintext reading"
+        );
+    }
+
+    // --- PVVX custom format ---
+
+    /// MAC A4:C1:38:A0:7B:03, temperature 0x08F2 = 2290 -> 22.90 degC,
+    /// humidity 0x1919 = 6425 -> 64.25 %, battery 0x091D = 2333 -> 2.333 V and
+    /// 0x10 = 16 %.
+    #[test]
+    fn pvvx_decodes_temperature_humidity_voltage_and_battery() {
+        let data = advertisement(
+            PVVX_UUID,
+            &[
                 0x03, 0x7B, 0xA0, 0x38, 0xC1, 0xA4, 0xF2, 0x08, 0x19, 0x19, 0x1D, 0x09, 0x10, 0x4A,
                 0x05,
             ],
         );
 
-        handle_service_data(&data);
+        let reading = handle_service_data(&data).expect("PVVX payload should decode");
+        assert_measurement(reading.temperature, 22.90);
+        assert_measurement(reading.humidity, 64.25);
+        assert_measurement(reading.voltage, 2.333);
+        assert_eq!(reading.battery, Some(16));
     }
 
+    /// Sub-zero temperatures are signed: 0xFF9C = -100 -> -1.00 degC.
     #[test]
-    fn test_bthome_service_data() {
-        let mut data = HashMap::new();
-        data.insert(
-            uuid!("0000fcd2-0000-1000-8000-00805f9b34fb"),
-            vec![
-                0x40, 0x00, 0x12, 0x01, 0x64, 0x02, 0x7D, 0x09, 0x03, 0x8D, 0x18,
+    fn pvvx_decodes_negative_temperature() {
+        let data = advertisement(
+            PVVX_UUID,
+            &[
+                0x03, 0x7B, 0xA0, 0x38, 0xC1, 0xA4, 0x9C, 0xFF, 0x19, 0x19, 0x1D, 0x09, 0x10, 0x4A,
+                0x05,
             ],
         );
 
-        handle_service_data(&data);
+        let reading = handle_service_data(&data).expect("PVVX payload should decode");
+        assert_measurement(reading.temperature, -1.00);
+    }
+
+    /// Anything below the 15-byte custom format is rejected rather than read
+    /// out of bounds.
+    #[test]
+    fn pvvx_rejects_payload_shorter_than_the_custom_format() {
+        let data = advertisement(
+            PVVX_UUID,
+            &[
+                0x03, 0x7B, 0xA0, 0x38, 0xC1, 0xA4, 0xF2, 0x08, 0x19, 0x19, 0x1D, 0x09, 0x10, 0x4A,
+            ],
+        );
+
+        assert!(handle_service_data(&data).is_none());
+    }
+
+    // --- Xiaomi MiBeacon / LYWSDCGQ ---
+
+    /// Frame control 0x2050 (MAC included, object included, unencrypted),
+    /// product id 0x01AA (LYWSDCGQ), event 0x100D (temperature + humidity):
+    /// 0x00EA = 234 -> 23.4 degC, 0x0261 = 609 -> 60.9 %.
+    #[test]
+    fn mijia_decodes_combined_temperature_and_humidity() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x50, 0x20, 0xAA, 0x01, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x0D, 0x10, 0x04,
+                0xEA, 0x00, 0x61, 0x02,
+            ],
+        );
+
+        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        assert_measurement(reading.temperature, 23.4);
+        assert_measurement(reading.humidity, 60.9);
+        assert_eq!(reading.battery, None);
+        assert_eq!(reading.voltage, None);
+    }
+
+    /// Event 0x1004 carries only a temperature.
+    #[test]
+    fn mijia_decodes_temperature_only_event() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x50, 0x20, 0xAA, 0x01, 0xF7, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x04, 0x10, 0x02,
+                0xEA, 0x00,
+            ],
+        );
+
+        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        assert_measurement(reading.temperature, 23.4);
+        assert_eq!(reading.humidity, None);
+    }
+
+    /// Event 0x1006 carries only a humidity.
+    #[test]
+    fn mijia_decodes_humidity_only_event() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x50, 0x20, 0xAA, 0x01, 0xF8, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x06, 0x10, 0x02,
+                0x61, 0x02,
+            ],
+        );
+
+        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        assert_measurement(reading.humidity, 60.9);
+        assert_eq!(reading.temperature, None);
+    }
+
+    /// Event 0x100A carries the battery percentage: 0x5B = 91 %.
+    #[test]
+    fn mijia_decodes_battery_event() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x50, 0x20, 0xAA, 0x01, 0xF6, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x0A, 0x10, 0x01,
+                0x5B,
+            ],
+        );
+
+        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        assert_eq!(reading.battery, Some(91));
+        assert_eq!(reading.temperature, None);
+        assert_eq!(reading.humidity, None);
+    }
+
+    /// A frame that stops right after the MAC has no event to decode.
+    #[test]
+    fn mijia_rejects_payload_without_an_event() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x50, 0x20, 0xAA, 0x01, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C,
+            ],
+        );
+
+        assert!(handle_service_data(&data).is_none());
+    }
+
+    /// An event id this decoder does not know is reported as undecodable rather
+    /// than guessed at.
+    #[test]
+    fn mijia_rejects_unknown_event_id() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x50, 0x20, 0xAA, 0x01, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x99, 0x10, 0x02,
+                0x00, 0x00,
+            ],
+        );
+
+        assert!(handle_service_data(&data).is_none());
+    }
+
+    /// Frame control 0x2070 additionally sets bit 5, so a capability byte (0x08,
+    /// no IO capability) sits between the MAC and the event. The same
+    /// 23.4 degC / 60.9 % reading as
+    /// `mijia_decodes_combined_temperature_and_humidity`, shifted one byte.
+    ///
+    /// Currently the event offset is the hardcoded constant 11, so the decoder
+    /// reads the capability byte as the event id and gives up.
+    #[test]
+    #[ignore = "known bug: the event offset is hardcoded to 11 instead of derived from the frame-control bits"]
+    fn mijia_decodes_frame_with_capability_byte() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x70, 0x20, 0xAA, 0x01, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x08, 0x0D, 0x10,
+                0x04, 0xEA, 0x00, 0x61, 0x02,
+            ],
+        );
+
+        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        assert_measurement(reading.temperature, 23.4);
+        assert_measurement(reading.humidity, 60.9);
+    }
+
+    /// Frame control 0x2040 clears bit 4, so no MAC is included and the event
+    /// starts six bytes earlier.
+    #[test]
+    #[ignore = "known bug: the event offset assumes the MAC-included frame-control bit is always set"]
+    fn mijia_decodes_frame_without_mac_address() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x40, 0x20, 0xAA, 0x01, 0xF5, 0x0D, 0x10, 0x04, 0xEA, 0x00, 0x61, 0x02,
+            ],
+        );
+
+        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        assert_measurement(reading.temperature, 23.4);
+        assert_measurement(reading.humidity, 60.9);
+    }
+
+    /// Frame control 0x2058 sets bit 3, marking the event payload as encrypted.
+    /// Without a bind key it must not be read as plaintext.
+    #[test]
+    #[ignore = "known bug: the frame-control encryption bit is never checked"]
+    fn mijia_encrypted_payload_is_not_decoded_as_plaintext() {
+        let data = advertisement(
+            MIJIA_UUID,
+            &[
+                0x58, 0x20, 0xAA, 0x01, 0xF5, 0x40, 0x71, 0xD5, 0xA8, 0x65, 0x4C, 0x0D, 0x10, 0x04,
+                0xEA, 0x00, 0x61, 0x02,
+            ],
+        );
+
+        assert!(
+            handle_service_data(&data).is_none(),
+            "an encrypted payload must not yield a plaintext reading"
+        );
+    }
+
+    // --- Dispatch ---
+
+    /// Service data for something that isn't a supported sensor is ignored.
+    #[test]
+    fn unrelated_service_uuid_is_ignored() {
+        let data = advertisement(
+            uuid!("0000180f-0000-1000-8000-00805f9b34fb"),
+            &[0x64, 0x00, 0x00],
+        );
+
+        assert!(handle_service_data(&data).is_none());
+    }
+
+    /// An advertisement with no service data at all is ignored.
+    #[test]
+    fn empty_service_data_is_ignored() {
+        assert!(handle_service_data(&HashMap::new()).is_none());
     }
 }
