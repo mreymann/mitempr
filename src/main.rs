@@ -1,17 +1,32 @@
 use clap::Parser;
 use log::LevelFilter;
+use std::path::PathBuf;
 use std::time::Duration;
 
+mod config;
 mod decoder;
 mod output;
 mod scan;
 
+use config::Config;
 use output::Format;
 
 /// Read environmental data from Bluetooth sensors.
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
+    /// Configuration file naming and calibrating known sensors
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Ignore sensors that have no entry in the configuration file
+    #[arg(long)]
+    only_known: bool,
+
+    /// Ignore advertisements weaker than this, in dBm (e.g. -90)
+    #[arg(long, value_name = "DBM", allow_negative_numbers = true)]
+    min_rssi: Option<i16>,
+
     /// Restart discovery if no reading arrives for this many seconds
     #[arg(long, default_value_t = 20)]
     watchdog: u64,
@@ -45,10 +60,28 @@ impl Args {
             _ => LevelFilter::Trace,
         }
     }
+
+    /// Read the configuration file, if one was given, and let the command line
+    /// override what it says.
+    fn load_config(&self) -> Result<Config, config::ConfigError> {
+        let mut config = match &self.config {
+            Some(path) => Config::load(path)?,
+            None => Config::default(),
+        };
+
+        if self.only_known {
+            config.set_only_known();
+        }
+        if let Some(min_rssi) = self.min_rssi {
+            config.set_min_rssi(min_rssi);
+        }
+
+        Ok(config)
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> bluer::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // RUST_LOG still wins, so a systemd unit can turn on debug logging without
@@ -58,13 +91,21 @@ async fn main() -> bluer::Result<()> {
         .parse_env("RUST_LOG")
         .init();
 
+    let config = args.load_config()?;
+
     let session = bluer::Session::new().await?;
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
 
     log::info!(
-        "scanning on {} (watchdog {}s, cooldown {}s)",
+        "scanning on {} ({} configured sensor(s){}, watchdog {}s, cooldown {}s)",
         adapter.name(),
+        config.configured_sensors(),
+        if config.only_known() {
+            ", ignoring the rest"
+        } else {
+            ""
+        },
         args.watchdog,
         args.cooldown
     );
@@ -73,6 +114,7 @@ async fn main() -> bluer::Result<()> {
         watchdog: Duration::from_secs(args.watchdog),
         cooldown: Duration::from_secs(args.cooldown),
         format: args.format,
+        config,
     };
 
     tokio::select! {

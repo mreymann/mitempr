@@ -1,5 +1,6 @@
 //! Continuous BLE discovery with a watchdog that restarts a wedged scan.
 
+use crate::config::Config;
 use crate::decoder;
 use crate::output::{Format, Reading};
 use bluer::{Adapter, AdapterEvent, Address, DeviceProperty, Result};
@@ -26,6 +27,8 @@ pub struct Settings {
     pub cooldown: Duration,
     /// How to write readings.
     pub format: Format,
+    /// Which sensors to report, and how to name and calibrate them.
+    pub config: Config,
 }
 
 /// Scan until the adapter disappears or the task is cancelled.
@@ -47,12 +50,18 @@ pub async fn run(adapter: &Adapter, settings: Settings) -> Result<()> {
     while let Some(event) = rx.recv().await {
         match event {
             AdapterEvent::DeviceAdded(addr) => {
+                // Checked before reading any properties, so a filtered-out device
+                // costs nothing but the event itself.
+                if !settings.config.accepts_address(addr) {
+                    continue;
+                }
+
                 if let Err(e) = handle_device(
                     adapter,
                     addr,
                     &mut last_service_data,
                     &last_reading_at,
-                    settings.format,
+                    &settings,
                 )
                 .await
                 {
@@ -144,14 +153,14 @@ async fn handle_device(
     addr: Address,
     last_service_data: &mut HashMap<Address, ServiceData>,
     last_reading_at: &Mutex<Instant>,
-    format: Format,
+    settings: &Settings,
 ) -> Result<()> {
     let device = adapter.device(addr)?;
 
     // One D-Bus round-trip for every property, instead of one round-trip each for
     // the name, the RSSI and the service data. At one advertisement per second
     // per sensor that is the difference the Pi Zero W notices.
-    let mut name = None;
+    let mut name: Option<String> = None;
     let mut rssi = None;
     let mut service_data = None;
     for property in device.all_properties().await? {
@@ -168,6 +177,11 @@ async fn handle_device(
         return Ok(());
     };
 
+    if !settings.config.accepts_rssi(rssi) {
+        log::trace!("{addr}: ignored, RSSI {rssi:?} is below the configured minimum");
+        return Ok(());
+    }
+
     // Identical to the advertisement we already reported, so some other property
     // changed. Sensors bump a packet counter on every broadcast, so a genuinely
     // new reading always differs here.
@@ -181,8 +195,17 @@ async fn handle_device(
         }
     }
 
-    if let Some(data) = decoder::handle_service_data(&service_data) {
-        Reading::new(addr, name, rssi, &data).emit(format);
+    if let Some(mut data) = decoder::handle_service_data(&service_data) {
+        // A configured name beats whatever the device calls itself, and the
+        // calibration offsets are applied before anything sees the reading.
+        if let Some(sensor) = settings.config.settings(addr) {
+            sensor.calibrate(&mut data);
+            if sensor.name.is_some() {
+                name = sensor.name.clone();
+            }
+        }
+
+        Reading::new(addr, name, rssi, &data).emit(settings.format);
 
         // Only an actual reading counts as proof that the scan is alive.
         *last_reading_at.lock().await = Instant::now();
