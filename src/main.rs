@@ -1,11 +1,12 @@
-use bluer::{Adapter, AdapterEvent, Address, Result};
+use bluer::{Adapter, AdapterEvent, Address, DeviceProperty, Result};
 use clap::Parser;
 use futures::StreamExt;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::sleep;
+use uuid::Uuid;
 mod decoder;
 
 /// Simple BLE discovery tool with watchdog restart (Python-style)
@@ -21,6 +22,9 @@ struct Args {
     cooldown: u64,
 }
 
+/// The service data of the advertisement last seen from a device.
+type ServiceData = HashMap<Uuid, Vec<u8>>;
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -33,7 +37,9 @@ async fn main() -> Result<()> {
         args.watchdog, args.cooldown
     );
 
-    let seen_devices = Arc::new(Mutex::new(HashSet::<Address>::new()));
+    // The advertisement each device last sent, so that a property change which
+    // carries no new reading (an RSSI update, say) is not reported twice.
+    let mut last_service_data: HashMap<Address, ServiceData> = HashMap::new();
     let last_ble_packet = Arc::new(Mutex::new(Instant::now()));
     let (tx, mut rx) = mpsc::unbounded_channel::<AdapterEvent>();
 
@@ -52,7 +58,12 @@ async fn main() -> Result<()> {
 
             loop {
                 println!("🔍 (Re)starting discovery...");
-                let mut events = match adapter.discover_devices().await {
+
+                // discover_devices_with_changes() re-emits DeviceAdded every time
+                // a device's properties change, which is what turns this into a
+                // continuous reader: discover_devices() only reports each device
+                // once, so every advertisement after the first was invisible.
+                let mut events = match adapter.discover_devices_with_changes().await {
                     Ok(ev) => ev,
                     Err(e) => {
                         eprintln!("❌ Failed to start discovery: {e}");
@@ -66,7 +77,6 @@ async fn main() -> Result<()> {
                         evt = events.next() => {
                             match evt {
                                 Some(AdapterEvent::DeviceAdded(addr)) => {
-                                    // ❌ no timestamp update here anymore
                                     let _ = tx.send(AdapterEvent::DeviceAdded(addr));
                                 }
                                 Some(AdapterEvent::DeviceRemoved(addr)) => {
@@ -84,15 +94,14 @@ async fn main() -> Result<()> {
                             let elapsed = last_ble_packet.lock().await.elapsed();
                             if elapsed > Duration::from_secs(watchdog) {
                                 println!(
-                                    "⏱ Watchdog: no BLE packets for {:?}, restarting discovery (count {})...",
-                                    elapsed, restart_counter
+                                    "⏱ Watchdog: no BLE packets for {elapsed:?}, restarting discovery (count {restart_counter})..."
                                 );
                                 restart_counter += 1;
 
                                 // Drop the current stream (equivalent to disable_le_scan)
                                 drop(events);
 
-                                // Wait before restarting (equivalent to Python’s 5s delay)
+                                // Wait before restarting (equivalent to Python's 5s delay)
                                 sleep(Duration::from_secs(cooldown)).await;
 
                                 break;
@@ -113,18 +122,14 @@ async fn main() -> Result<()> {
     while let Some(evt) = rx.recv().await {
         match evt {
             AdapterEvent::DeviceAdded(addr) => {
-                let mut seen = seen_devices.lock().await;
-                if !seen.contains(&addr) {
-                    seen.insert(addr);
-                    if let Err(e) = handle_device(&adapter, addr, last_ble_packet.clone()).await {
-                        eprintln!("Error handling device {addr}: {e}");
-                    }
+                if let Err(e) =
+                    handle_device(&adapter, addr, &mut last_service_data, &last_ble_packet).await
+                {
+                    eprintln!("Error handling device {addr}: {e}");
                 }
             }
             AdapterEvent::DeviceRemoved(addr) => {
-                println!("❌ Device removed: {addr}");
-                let mut seen = seen_devices.lock().await;
-                seen.remove(&addr);
+                last_service_data.remove(&addr);
             }
             _ => {}
         }
@@ -136,35 +141,49 @@ async fn main() -> Result<()> {
 async fn handle_device(
     adapter: &Adapter,
     addr: Address,
-    last_ble_packet: Arc<Mutex<Instant>>,
+    last_service_data: &mut HashMap<Address, ServiceData>,
+    last_ble_packet: &Mutex<Instant>,
 ) -> Result<()> {
     let device = adapter.device(addr)?;
-    let name = device.name().await?.unwrap_or_else(|| "<unknown>".into());
-    let rssi = device.rssi().await?.unwrap_or(0);
 
-    println!("📡 {addr} ({name}), RSSI={rssi}");
-
-    if let Some(data_map) = device.service_data().await? {
-        for (uuid, data) in &data_map {
-            println!("  Service {uuid}: {:02X?}", data);
-        }
-
-        if let Some(decoded) = decoder::handle_service_data(&data_map) {
-            println!("  🔍 Got sensor reading: {:?}", decoded);
-
-            // ✅ Reset watchdog timer only on actual service data
-            *last_ble_packet.lock().await = Instant::now();
+    // One D-Bus round-trip for every property, instead of one round-trip each for
+    // the name, the RSSI and the service data. At one advertisement per second
+    // per sensor that is the difference the Pi Zero W notices.
+    let mut name = None;
+    let mut rssi = None;
+    let mut service_data = None;
+    for property in device.all_properties().await? {
+        match property {
+            DeviceProperty::Name(value) => name = Some(value),
+            DeviceProperty::Rssi(value) => rssi = Some(value),
+            DeviceProperty::ServiceData(value) => service_data = Some(value),
+            _ => {}
         }
     }
 
-    // Uncomment this if you also want manufacturer data
-    /*
-    if let Some(mdata) = device.manufacturer_data().await? {
-        for (id, data) in mdata {
-            println!("  Manufacturer {id:#06X}: {:02X?}", data);
-        }
+    // No service data at all: not something this tool can read.
+    let Some(service_data) = service_data else {
+        return Ok(());
+    };
+
+    // Identical to the advertisement we already reported, so some other property
+    // changed. Sensors bump a packet counter on every broadcast, so a genuinely
+    // new reading always differs here.
+    if last_service_data.get(&addr) == Some(&service_data) {
+        return Ok(());
     }
-    */
+
+    if let Some(decoded) = decoder::handle_service_data(&service_data) {
+        let name = name.as_deref().unwrap_or("<unknown>");
+        let rssi = rssi.map_or_else(|| "n/a".to_string(), |value| value.to_string());
+        println!("📡 {addr} ({name}), RSSI={rssi}");
+        println!("  🔍 Got sensor reading: {decoded:?}");
+
+        // ✅ Reset watchdog timer only on actual sensor readings
+        *last_ble_packet.lock().await = Instant::now();
+    }
+
+    last_service_data.insert(addr, service_data);
 
     Ok(())
 }
