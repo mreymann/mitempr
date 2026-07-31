@@ -84,8 +84,7 @@ async fn main() -> Result<()> {
                             let elapsed = last_ble_packet.lock().await.elapsed();
                             if elapsed > Duration::from_secs(watchdog) {
                                 println!(
-                                    "⏱ Watchdog: no BLE packets for {:?}, restarting discovery (count {})...",
-                                    elapsed, restart_counter
+                                    "⏱ Watchdog: no BLE packets for {elapsed:?}, restarting discovery (count {restart_counter})..."
                                 );
                                 restart_counter += 1;
 
@@ -146,11 +145,11 @@ async fn handle_device(
 
     if let Some(data_map) = device.service_data().await? {
         for (uuid, data) in &data_map {
-            println!("  Service {uuid}: {:02X?}", data);
+            println!("  Service {uuid}: {data:02X?}");
         }
 
         if let Some(decoded) = decoder::handle_service_data(&data_map) {
-            println!("  🔍 Got sensor reading: {:?}", decoded);
+            println!("  🔍 Got sensor reading: {decoded:?}");
 
             // ✅ Reset watchdog timer only on actual service data
             *last_ble_packet.lock().await = Instant::now();

@@ -25,15 +25,15 @@ const PVVX_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000181A_0000_1000_8000_00805F
 const BTHOME_V2_PREAMBLE: [u8; 4] = [0x16, 0xd2, 0xfc, 0x40];
 
 // Function to check the Service Data keys and return the classification
-fn get_packet_type(service_data: &HashMap<Uuid, Vec<u8>>) -> (BlePacketType, Option<&Vec<u8>>) {
+fn get_packet_type(service_data: &HashMap<Uuid, Vec<u8>>) -> (BlePacketType, Option<&[u8]>) {
     if let Some(data) = service_data.get(&MIJIA_SERVICE_UUID) {
-        return (BlePacketType::Mijia, Some(data));
+        return (BlePacketType::Mijia, Some(data.as_slice()));
     }
     if let Some(data) = service_data.get(&BTHOME_SERVICE_UUID) {
-        return (BlePacketType::BTHome, Some(data));
+        return (BlePacketType::BTHome, Some(data.as_slice()));
     }
     if let Some(data) = service_data.get(&PVVX_SERVICE_UUID) {
-        return (BlePacketType::Pvvx, Some(data));
+        return (BlePacketType::Pvvx, Some(data.as_slice()));
     }
     (BlePacketType::Other, None)
 }
@@ -54,7 +54,7 @@ pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) -> Option<SensorData> 
                         return Some(decoded);
                     }
                     Err(e) => {
-                        println!("  ⚠️  Could not decode Mijia payload: {}", e);
+                        println!("  ⚠️  Could not decode Mijia payload: {e}");
                     }
                 }
             }
@@ -91,7 +91,7 @@ pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) -> Option<SensorData> 
 }
 
 // --- BTHome Decoder ---
-fn decode_bthome(payload: &Vec<u8>) -> Option<SensorData> {
+fn decode_bthome(payload: &[u8]) -> Option<SensorData> {
     // 1. Create the full data array by prepending the preamble
     let mut all_data = Vec::new();
     all_data.extend_from_slice(&BTHOME_V2_PREAMBLE);
@@ -160,7 +160,7 @@ fn decode_bthome(payload: &Vec<u8>) -> Option<SensorData> {
 }
 
 // --- PVVX Decoder ---
-fn decode_pvvx(payload: &Vec<u8>) -> Option<SensorData> {
+fn decode_pvvx(payload: &[u8]) -> Option<SensorData> {
     const MIN_LENGTH: usize = 15;
     const MAC_LENGTH: usize = 6;
 
@@ -212,7 +212,7 @@ fn decode_pvvx(payload: &Vec<u8>) -> Option<SensorData> {
 }
 
 // --- LYWSDCGQ V3 Decoder ---
-fn decode_mijia(payload: &Vec<u8>) -> Result<SensorData, String> {
+fn decode_mijia(payload: &[u8]) -> Result<SensorData, String> {
     // The Xiaomi Manufacturer ID (0x04C0) is already stripped by bluer.
     // The byte at index 11 is the Type Identifier byte (0x0D, 0x06, 0x0A, etc.)
     const TYPE_IDENTIFIER_OFFSET: usize = 11;
@@ -261,8 +261,7 @@ fn decode_mijia(payload: &Vec<u8>) -> Result<SensorData, String> {
 
         _ => {
             return Err(format!(
-                "Unrecognized or incomplete LYWSDCGQ V3 payload (Type 0x{:02X}, Length {})",
-                type_identifier,
+                "Unrecognized or incomplete LYWSDCGQ V3 payload (Type 0x{type_identifier:02X}, Length {})",
                 payload.len()
             ));
         }

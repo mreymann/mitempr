@@ -1,6 +1,5 @@
 # Generated files
 /target/
-/Cargo.lock
 *.bk
 *.bak.rs
 
