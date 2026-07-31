@@ -10,19 +10,38 @@ pub enum BlePacketType {
 }
 
 // --- SensorData Struct (from your working code) ---
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SensorData {
     pub temperature: Option<f32>,
     pub humidity: Option<f32>,
     pub battery: Option<u8>,
     pub voltage: Option<f32>,
+    /// Pressure in hPa.
+    pub pressure: Option<f32>,
+    /// Illuminance in lux.
+    pub illuminance: Option<f32>,
+    /// Moisture in percent.
+    pub moisture: Option<f32>,
 }
+
+impl SensorData {
+    /// True when nothing in the advertisement could be turned into a reading.
+    fn is_empty(&self) -> bool {
+        self.temperature.is_none()
+            && self.humidity.is_none()
+            && self.battery.is_none()
+            && self.voltage.is_none()
+            && self.pressure.is_none()
+            && self.illuminance.is_none()
+            && self.moisture.is_none()
+    }
+}
+
 // --- Constants ---
 // Define the custom UUIDs used by Xiaomi/BTHome/PVVX devices
 const MIJIA_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000FE95_0000_1000_8000_00805F9B34FB);
 const BTHOME_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000FCD2_0000_1000_8000_00805F9B34FB);
 const PVVX_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000181A_0000_1000_8000_00805F9B34FB);
-const BTHOME_V2_PREAMBLE: [u8; 4] = [0x16, 0xd2, 0xfc, 0x40];
 
 // Function to check the Service Data keys and return the classification
 fn get_packet_type(service_data: &HashMap<Uuid, Vec<u8>>) -> (BlePacketType, Option<&[u8]>) {
@@ -91,69 +110,138 @@ pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) -> Option<SensorData> 
 }
 
 // --- BTHome Decoder ---
-fn decode_bthome(payload: &[u8]) -> Option<SensorData> {
-    // 1. Create the full data array by prepending the preamble
-    let mut all_data = Vec::new();
-    all_data.extend_from_slice(&BTHOME_V2_PREAMBLE);
-    all_data.extend_from_slice(payload); // payload is the [40, 00, 73, 0C, ...]
 
-    // 2. The working decoder expects the full array but is sliced to skip the first 4 bytes
-    let data = &all_data[4..];
+/// The BTHome v2 device-information byte, i.e. the first byte of the service
+/// data. See <https://bthome.io/format/>.
+struct BthomeDeviceInfo {
+    /// Bits 5-7. This decoder only understands version 2.
+    version: u8,
+    /// Bit 0. When set, everything after this byte is ciphertext.
+    encrypted: bool,
+}
 
-    let mut result = SensorData {
-        temperature: None,
-        humidity: None,
-        battery: None,
-        voltage: None,
+impl BthomeDeviceInfo {
+    fn parse(byte: u8) -> Self {
+        Self {
+            version: (byte >> 5) & 0x07,
+            encrypted: byte & 0x01 != 0,
+        }
+    }
+}
+
+/// Number of value bytes that follow a BTHome object id, or `None` if the
+/// length cannot be determined.
+///
+/// This is what keeps the parser in sync: an object we do not interpret still
+/// has to be skipped by exactly the right number of bytes, otherwise the next
+/// value byte gets read as an object id. Lengths are from
+/// <https://bthome.io/format/>. `tail` is the payload after the object id and
+/// is only needed for the few variable-length objects.
+fn bthome_value_len(object_id: u8, tail: &[u8]) -> Option<usize> {
+    let len = match object_id {
+        // 1-byte sensor values: packet id, battery, count, humidity, moisture,
+        // UV index, temperature, channel, light level, settings revision.
+        0x00 | 0x01 | 0x09 | 0x2E | 0x2F | 0x46 | 0x57 | 0x58 | 0x59 | 0x60 | 0x64 | 0x65 => 1,
+        // 2-byte sensor values.
+        0x02 | 0x03 | 0x06 | 0x07 | 0x08 | 0x0C | 0x0D | 0x0E | 0x12 | 0x13 | 0x14 | 0x40
+        | 0x41 | 0x43 | 0x44 | 0x45 | 0x47 | 0x48 | 0x49 | 0x4A | 0x51 | 0x52 | 0x56 | 0x5A
+        | 0x5D | 0x5E | 0x5F | 0x61 => 2,
+        // 3-byte sensor values: pressure, illuminance, energy, power, duration, gas.
+        0x04 | 0x05 | 0x0A | 0x0B | 0x42 | 0x4B => 3,
+        // 4-byte sensor values.
+        0x4C | 0x4D | 0x4E | 0x4F | 0x50 | 0x55 | 0x5B | 0x5C | 0x62 | 0x63 => 4,
+        // Binary sensors and the button event are one byte each.
+        0x0F..=0x11 | 0x15..=0x2D | 0x3A => 1,
+        // Command and dimmer events carry a step count for some event types.
+        0x3B => match *tail.first()? {
+            0x03 | 0x04 => 2,
+            _ => 1,
+        },
+        0x3C => match *tail.first()? {
+            0x01 | 0x02 => 2,
+            _ => 1,
+        },
+        // Text and raw are length-prefixed.
+        0x53 | 0x54 => 1 + usize::from(*tail.first()?),
+        _ => return None,
     };
+    Some(len)
+}
 
-    let mut i = 1; // Skip first byte (00) - This is the Packet ID in the [40, 00] header
-    while i < data.len() {
-        if i + 1 >= data.len() {
+/// Read a 24-bit little-endian unsigned value.
+fn u24_le(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0])
+}
+
+fn decode_bthome(payload: &[u8]) -> Option<SensorData> {
+    let (&info_byte, mut rest) = payload.split_first()?;
+    let info = BthomeDeviceInfo::parse(info_byte);
+
+    if info.version != 2 {
+        println!(
+            "  [!] BTHome v{} is not supported (device info 0x{info_byte:02X})",
+            info.version
+        );
+        return None;
+    }
+
+    if info.encrypted {
+        // Reading the ciphertext as if it were objects yields plausible-looking
+        // nonsense, so refuse instead of inventing measurements.
+        println!("  [!] BTHome payload is encrypted and no bind key is configured");
+        return None;
+    }
+
+    let mut result = SensorData::default();
+
+    while let Some((&object_id, tail)) = rest.split_first() {
+        let Some(len) = bthome_value_len(object_id, tail) else {
+            println!(
+                "  [!] Unknown BTHome object id 0x{object_id:02X}; stopping here rather than \
+                 guessing its length"
+            );
+            break;
+        };
+
+        if tail.len() < len {
+            println!("  [!] Truncated BTHome object 0x{object_id:02X}");
             break;
         }
 
-        match data[i] {
-            0x01 => {
-                // Battery (%) (1 byte)
-                if i + 1 >= data.len() {
-                    break;
-                }
-                result.battery = Some(data[i + 1]);
-                i += 2;
-            }
+        let (value, remainder) = tail.split_at(len);
+        rest = remainder;
+
+        match object_id {
+            0x01 => result.battery = Some(value[0]),
             0x02 => {
-                // Temperature (2 bytes, factor 0.01)
-                if i + 2 >= data.len() {
-                    break;
-                }
-                let temp_raw = i16::from_le_bytes([data[i + 1], data[i + 2]]);
-                result.temperature = Some(temp_raw as f32 / 100.0);
-                i += 3;
+                result.temperature =
+                    Some(f32::from(i16::from_le_bytes([value[0], value[1]])) / 100.0);
+            }
+            0x45 => {
+                result.temperature =
+                    Some(f32::from(i16::from_le_bytes([value[0], value[1]])) / 10.0);
             }
             0x03 => {
-                // Humidity (2 bytes, factor 0.01)
-                if i + 2 >= data.len() {
-                    break;
-                }
-                let hum_raw = u16::from_le_bytes([data[i + 1], data[i + 2]]);
-                result.humidity = Some(hum_raw as f32 / 100.0);
-                i += 3;
+                result.humidity = Some(f32::from(u16::from_le_bytes([value[0], value[1]])) / 100.0);
             }
+            0x2E => result.humidity = Some(f32::from(value[0])),
             0x0C => {
-                // Voltage (2 bytes, factor 0.001)
-                if i + 2 >= data.len() {
-                    break;
-                }
-                let voltage_raw = u16::from_le_bytes([data[i + 1], data[i + 2]]);
-                result.voltage = Some(voltage_raw as f32 / 1000.0);
-                i += 3;
+                result.voltage = Some(f32::from(u16::from_le_bytes([value[0], value[1]])) / 1000.0);
             }
-            _ => {
-                //println!("  ⚠️  Unknown type 0x{:02x} at position {}", data[i], i);
-                i += 2; // Try to skip an assumed Type + 1 byte value to continue
+            0x04 => result.pressure = Some(u24_le(value) as f32 / 100.0),
+            0x05 => result.illuminance = Some(u24_le(value) as f32 / 100.0),
+            0x14 => {
+                result.moisture = Some(f32::from(u16::from_le_bytes([value[0], value[1]])) / 100.0);
             }
+            0x2F => result.moisture = Some(f32::from(value[0])),
+            // Skipped by exactly the right length, just not reported (yet):
+            // packet id, binary sensors, events, power meters, air quality, ...
+            _ => {}
         }
+    }
+
+    if result.is_empty() {
+        return None;
     }
 
     Some(result)
@@ -208,6 +296,7 @@ fn decode_pvvx(payload: &[u8]) -> Option<SensorData> {
         humidity,
         battery,
         voltage,
+        ..Default::default()
     })
 }
 
@@ -272,6 +361,7 @@ fn decode_mijia(payload: &[u8]) -> Result<SensorData, String> {
         humidity,
         battery: battery_percent,
         voltage,
+        ..Default::default()
     })
 }
 
@@ -338,12 +428,11 @@ mod tests {
     ///
     /// Illuminance 0x0003E8 = 1000 -> 10.00 lux, then 0x097D = 2429 -> 24.29 degC.
     ///
-    /// Currently the unknown-object fallback advances the cursor by a guessed two
-    /// bytes, so it lands mid-value: byte 0x03 is mistaken for a humidity object
-    /// and the parser reports humidity 5.12 % while dropping the temperature
-    /// entirely. Ignored until the object-length table lands.
+    /// Before the object-length table, the unknown-object fallback advanced the
+    /// cursor by a guessed two bytes and landed mid-value: byte 0x03 was mistaken
+    /// for a humidity object, so the parser reported humidity 5.12 % and dropped
+    /// the temperature entirely.
     #[test]
-    #[ignore = "known bug: unknown object IDs advance the cursor by a guessed 2 bytes, which desyncs the parser on 3-byte objects"]
     fn bthome_three_byte_object_does_not_desync_the_parser() {
         let data = advertisement(
             BTHOME_UUID,
@@ -351,6 +440,7 @@ mod tests {
         );
 
         let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        assert_measurement(reading.illuminance, 10.00);
         assert_measurement(reading.temperature, 24.29);
         assert_eq!(
             reading.humidity, None,
@@ -358,14 +448,101 @@ mod tests {
         );
     }
 
+    /// Pressure 0x018BCD = 101325 -> 1013.25 hPa, the other three-byte object.
+    #[test]
+    fn bthome_decodes_pressure() {
+        let data = advertisement(BTHOME_UUID, &[0x40, 0x04, 0xCD, 0x8B, 0x01]);
+
+        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        assert_measurement(reading.pressure, 1013.25);
+    }
+
+    /// The single-byte humidity (0x2E) and moisture (0x2F) objects.
+    #[test]
+    fn bthome_decodes_single_byte_humidity_and_moisture() {
+        let data = advertisement(BTHOME_UUID, &[0x40, 0x2E, 0x33, 0x2F, 0x22]);
+
+        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        assert_measurement(reading.humidity, 51.0);
+        assert_measurement(reading.moisture, 34.0);
+    }
+
+    /// Temperature object 0x45 uses factor 0.1: 0x00EA = 234 -> 23.4 degC.
+    #[test]
+    fn bthome_decodes_low_resolution_temperature() {
+        let data = advertisement(BTHOME_UUID, &[0x40, 0x45, 0xEA, 0x00]);
+
+        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        assert_measurement(reading.temperature, 23.4);
+    }
+
+    /// Objects this tool does not report must still be skipped by the right
+    /// length. Here a 2-byte CO2 object (0x12) sits between two objects we do
+    /// report; getting its length wrong would lose the humidity.
+    #[test]
+    fn bthome_skips_unreported_objects_without_losing_the_rest() {
+        let data = advertisement(
+            BTHOME_UUID,
+            &[0x40, 0x02, 0x7D, 0x09, 0x12, 0xE8, 0x03, 0x03, 0x8D, 0x18],
+        );
+
+        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        assert_measurement(reading.temperature, 24.29);
+        assert_measurement(reading.humidity, 62.85);
+    }
+
+    /// A genuinely unknown object id has no known length, so parsing stops there
+    /// instead of guessing. Everything decoded before it is still reported.
+    #[test]
+    fn bthome_stops_at_an_unknown_object_id() {
+        let data = advertisement(
+            BTHOME_UUID,
+            &[0x40, 0x02, 0x7D, 0x09, 0xF0, 0xAA, 0xBB, 0x03, 0x8D, 0x18],
+        );
+
+        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        assert_measurement(reading.temperature, 24.29);
+        assert_eq!(
+            reading.humidity, None,
+            "objects after an unknown id cannot be located reliably"
+        );
+    }
+
+    /// An object whose value is cut off by the end of the advertisement is
+    /// dropped rather than read out of bounds.
+    #[test]
+    fn bthome_ignores_a_truncated_object() {
+        let data = advertisement(BTHOME_UUID, &[0x40, 0x02, 0x7D, 0x09, 0x03, 0x8D]);
+
+        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        assert_measurement(reading.temperature, 24.29);
+        assert_eq!(reading.humidity, None);
+    }
+
+    /// Bits 5-7 of the device-info byte carry the version. 0x20 is v1, which
+    /// this decoder does not implement, so it must not be parsed as v2.
+    #[test]
+    fn bthome_rejects_a_non_v2_payload() {
+        let data = advertisement(BTHOME_UUID, &[0x20, 0x02, 0x7D, 0x09]);
+
+        assert!(handle_service_data(&data).is_none());
+    }
+
+    /// A payload with nothing but a device-info byte carries no measurement.
+    #[test]
+    fn bthome_rejects_a_payload_without_objects() {
+        let data = advertisement(BTHOME_UUID, &[0x40]);
+
+        assert!(handle_service_data(&data).is_none());
+    }
+
     /// Device info 0x41 sets bit 0, marking the payload as encrypted. Without a
     /// bind key nothing here can be decoded, and the ciphertext must not be
     /// parsed as if it were plaintext objects.
     ///
-    /// Currently the device-info byte is skipped unread, so the first ciphertext
-    /// bytes are happily interpreted as a temperature object.
+    /// Before the device-info byte was parsed it was skipped unread, so the
+    /// first ciphertext bytes were happily interpreted as a temperature object.
     #[test]
-    #[ignore = "known bug: the device-info byte is never parsed, so the encryption flag is ignored"]
     fn bthome_encrypted_payload_is_not_decoded_as_plaintext() {
         let data = advertisement(
             BTHOME_UUID,
