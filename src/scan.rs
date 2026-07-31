@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::decoder;
+use crate::exec::Hook;
 use crate::output::{Format, Reading};
 use bluer::{Adapter, AdapterEvent, Address, DeviceProperty, Result};
 use futures::StreamExt;
@@ -29,6 +30,8 @@ pub struct Settings {
     pub format: Format,
     /// Which sensors to report, and how to name and calibrate them.
     pub config: Config,
+    /// External program to run per reading, if any.
+    pub exec: Option<Hook>,
 }
 
 /// Scan until the adapter disappears or the task is cancelled.
@@ -205,7 +208,12 @@ async fn handle_device(
             }
         }
 
-        Reading::new(addr, name, rssi, &data).emit(settings.format);
+        let reading = Reading::new(addr, name, rssi, &data);
+        reading.emit(settings.format);
+
+        if let Some(hook) = &settings.exec {
+            hook.run(&reading);
+        }
 
         // Only an actual reading counts as proof that the scan is alive.
         *last_reading_at.lock().await = Instant::now();

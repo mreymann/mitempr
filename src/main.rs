@@ -5,10 +5,12 @@ use std::time::Duration;
 
 mod config;
 mod decoder;
+mod exec;
 mod output;
 mod scan;
 
 use config::Config;
+use exec::Hook;
 use output::Format;
 
 /// Read environmental data from Bluetooth sensors.
@@ -26,6 +28,15 @@ struct Args {
     /// Ignore advertisements weaker than this, in dBm (e.g. -90)
     #[arg(long, value_name = "DBM", allow_negative_numbers = true)]
     min_rssi: Option<i16>,
+
+    /// Run this program once per reading, with the reading in MITEMPR_*
+    /// environment variables and as JSON on its standard input
+    #[arg(long, value_name = "PATH")]
+    exec: Option<PathBuf>,
+
+    /// Shortest gap in seconds between two --exec runs for the same sensor
+    #[arg(long, value_name = "SECS", default_value_t = 0, requires = "exec")]
+    exec_interval: u64,
 
     /// Restart discovery if no reading arrives for this many seconds
     #[arg(long, default_value_t = 20)]
@@ -115,6 +126,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cooldown: Duration::from_secs(args.cooldown),
         format: args.format,
         config,
+        exec: args
+            .exec
+            .clone()
+            .map(|program| Hook::new(program, Duration::from_secs(args.exec_interval))),
     };
 
     tokio::select! {
