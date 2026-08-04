@@ -4,13 +4,19 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   release:
     strategy:
+      # One broken target should not hide the others.
+      fail-fast: false
       matrix:
         include:
           # Linux x86_64 (musl)
@@ -38,11 +44,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Prebuilt binary — `cargo install cross` compiles from source and adds
+      # minutes to every job.
       - name: Install cross
         if: matrix.build == 'cross'
-        run: cargo install cross
+        uses: taiki-e/install-action@cross
 
       - name: Install target
         if: matrix.build == 'cargo'
@@ -61,17 +74,18 @@ jobs:
           fi
         shell: bash
 
-      - name: Strip binary
-        if: runner.os != 'Windows' && matrix.build == 'cargo'
-        run: strip target/${{ matrix.target }}/release/${{ matrix.binary }}
+      # No explicit strip step: [profile.release] already sets strip = true.
 
-      - name: Rename binary
+      - name: Rename binary and checksum it
         shell: bash
         run: |
           cp target/${{ matrix.target }}/release/${{ matrix.binary }} \
              ${{ matrix.asset }}
+          sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset }}
+          files: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256

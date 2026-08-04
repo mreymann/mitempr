@@ -8,34 +8,100 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::time::sleep;
 use uuid::Uuid;
 mod decoder;
+mod output;
+mod scan;
 
-/// Simple BLE discovery tool with watchdog restart (Python-style)
+use config::Config;
+use output::Format;
+
+/// Read environmental data from Bluetooth sensors.
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
-    /// Watchdog timeout in seconds (restart if no packets seen)
+    /// Configuration file naming and calibrating known sensors
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Ignore sensors that have no entry in the configuration file
+    #[arg(long)]
+    only_known: bool,
+
+    /// Ignore advertisements weaker than this, in dBm (e.g. -90)
+    #[arg(long, value_name = "DBM", allow_negative_numbers = true)]
+    min_rssi: Option<i16>,
+
+    /// Restart discovery if no reading arrives for this many seconds
     #[arg(long, default_value_t = 20)]
     watchdog: u64,
 
-    /// Cooldown pause between restarts in seconds
+    /// Cooldown pause between discovery restarts in seconds
     #[arg(long, default_value_t = 5)]
     cooldown: u64,
+
+    /// How to write readings: a human-readable line, or one JSON object per line
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    format: Format,
+
+    /// Log more; repeat for even more (-v debug, -vv trace)
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Log only warnings and errors. Readings written with --format json are not
+    /// affected, since those go to stdout rather than through the logger.
+    #[arg(short, long, conflicts_with = "verbose")]
+    quiet: bool,
+}
+
+impl Args {
+    fn log_level(&self) -> LevelFilter {
+        if self.quiet {
+            return LevelFilter::Warn;
+        }
+        match self.verbose {
+            0 => LevelFilter::Info,
+            1 => LevelFilter::Debug,
+            _ => LevelFilter::Trace,
+        }
+    }
+
+    /// Read the configuration file, if one was given, and let the command line
+    /// override what it says.
+    fn load_config(&self) -> Result<Config, config::ConfigError> {
+        let mut config = match &self.config {
+            Some(path) => Config::load(path)?,
+            None => Config::default(),
+        };
+
+        if self.only_known {
+            config.set_only_known();
+        }
+        if let Some(min_rssi) = self.min_rssi {
+            config.set_min_rssi(min_rssi);
+        }
+
+        Ok(config)
+    }
 }
 
 /// The service data of the advertisement last seen from a device.
 type ServiceData = HashMap<Uuid, Vec<u8>>;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    // RUST_LOG still wins, so a systemd unit can turn on debug logging without
+    // its command line changing.
+    env_logger::Builder::new()
+        .filter_level(args.log_level())
+        .parse_env("RUST_LOG")
+        .init();
+
+    let config = args.load_config()?;
 
     let session = bluer::Session::new().await?;
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
-    println!(
-        "Starting robust continuous BLE discovery (watchdog={}s, cooldown={}s)...",
-        args.watchdog, args.cooldown
-    );
 
     // The advertisement each device last sent, so that a property change which
     // carries no new reading (an RSSI update, say) is not reported twice.
@@ -110,10 +176,9 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Small delay before reinitializing discovery
-                sleep(Duration::from_secs(2)).await;
-            }
-        });
+    tokio::select! {
+        result = scan::run(&adapter, settings) => result?,
+        () = shutdown_requested() => log::info!("shutting down"),
     }
 
     //
@@ -131,11 +196,11 @@ async fn main() -> Result<()> {
             AdapterEvent::DeviceRemoved(addr) => {
                 last_service_data.remove(&addr);
             }
-            _ => {}
         }
     }
 
-    Ok(())
+    #[cfg(not(unix))]
+    wait_for_ctrl_c().await;
 }
 
 async fn handle_device(

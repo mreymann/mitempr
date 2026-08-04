@@ -1,17 +1,43 @@
 use std::collections::HashMap;
+use std::fmt;
 use uuid::Uuid;
 
-#[derive(Debug)]
-pub enum BlePacketType {
-    Mijia,  // 0xFE95
-    BTHome, // 0xFCD2
-    Pvvx,   // 0x181A
+/// The advertisement format a sensor is broadcasting in.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum SensorFormat {
+    /// Xiaomi MiBeacon, service UUID 0xFE95.
+    MiBeacon,
+    /// BTHome v2, service UUID 0xFCD2.
+    BtHome,
+    /// PVVX custom format, service UUID 0x181A.
+    Pvvx,
+    /// Nothing this tool understands.
+    #[default]
     Other,
+}
+
+impl SensorFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MiBeacon => "mibeacon",
+            Self::BtHome => "bthome",
+            Self::Pvvx => "pvvx",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl fmt::Display for SensorFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 // --- SensorData Struct (from your working code) ---
 #[derive(Debug, Default)]
 pub struct SensorData {
+    /// Which decoder produced this reading.
+    pub format: SensorFormat,
     pub temperature: Option<f32>,
     pub humidity: Option<f32>,
     pub battery: Option<u8>,
@@ -44,62 +70,64 @@ const BTHOME_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000FCD2_0000_1000_8000_0080
 const PVVX_SERVICE_UUID: Uuid = Uuid::from_u128(0x0000181A_0000_1000_8000_00805F9B34FB);
 
 // Function to check the Service Data keys and return the classification
-fn get_packet_type(service_data: &HashMap<Uuid, Vec<u8>>) -> (BlePacketType, Option<&Vec<u8>>) {
+fn get_packet_type(service_data: &HashMap<Uuid, Vec<u8>>) -> (SensorFormat, Option<&[u8]>) {
     if let Some(data) = service_data.get(&MIJIA_SERVICE_UUID) {
-        return (BlePacketType::Mijia, Some(data));
+        return (SensorFormat::MiBeacon, Some(data.as_slice()));
     }
     if let Some(data) = service_data.get(&BTHOME_SERVICE_UUID) {
-        return (BlePacketType::BTHome, Some(data));
+        return (SensorFormat::BtHome, Some(data.as_slice()));
     }
     if let Some(data) = service_data.get(&PVVX_SERVICE_UUID) {
-        return (BlePacketType::Pvvx, Some(data));
+        return (SensorFormat::Pvvx, Some(data.as_slice()));
     }
-    (BlePacketType::Other, None)
+    (SensorFormat::Other, None)
 }
 
-/// Decode or print service data from BLE advertisements.
+/// Decode service data from a BLE advertisement.
 ///
 /// This function is intentionally crate-agnostic: it doesn't depend on `bluer`
 /// or any Bluetooth stack, only on standard Rust types.
+///
+/// Decode failures are logged at debug level, not warn: a sensor broadcasts
+/// several times a minute, so a payload this tool cannot read would otherwise
+/// repeat the same warning forever.
 pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) -> Option<SensorData> {
-    let (packet_type, payload) = get_packet_type(data);
+    let (format, payload) = get_packet_type(data);
+    let payload = payload?;
 
-    match packet_type {
-        BlePacketType::Mijia => {
-            if let Some(bytes) = payload {
-                match decode_mijia(bytes) {
-                    Ok(decoded) => {
-                        //println!("  🔍 Decoded Mijia data: {:?}", decoded);
-                        return Some(decoded);
-                    }
-                    Err(e) => {
-                        println!("  ⚠️  Could not decode Mijia payload: {}", e);
-                    }
-                }
-            }
-        }
+    match format {
+        SensorFormat::MiBeacon => match decode_mijia(payload) {
+            Ok(decoded) => return Some(decoded),
+            Err(e) => log::debug!("could not decode MiBeacon payload: {e}"),
+        },
 
-        BlePacketType::BTHome => {
-            if let Some(bytes) = payload {
-                if let Some(decoded) = decode_bthome(bytes) {
-                    //println!("  🔍 Decoded BTHome data: {:?}", decoded);
-                    return Some(decoded);
-                } else {
-                    println!("  ⚠️  Could not decode BTHome payload");
-                }
-            }
-        }
+        SensorFormat::BtHome => match decode_bthome(payload) {
+            Some(decoded) => return Some(decoded),
+            None => log::debug!("could not decode BTHome payload"),
+        },
 
-        BlePacketType::Pvvx => {
-            if let Some(bytes) = payload {
-                if let Some(decoded) = decode_pvvx(bytes) {
-                    //println!("  🔍 Decoded PVVX data: {:?}", decoded);
-                    return Some(decoded);
-                } else {
-                    println!("  ⚠️  Could not decode PVVX payload");
-                }
-            }
-        }
+        SensorFormat::Pvvx => match decode_pvvx(payload) {
+            Some(decoded) => return Some(decoded),
+            None => log::debug!("could not decode PVVX payload"),
+        },
+
+        // Every phone, watch and TV in range lands here.
+        SensorFormat::Other => {}
+    }
+
+    None
+}
+
+// --- BTHome Decoder ---
+
+/// The BTHome v2 device-information byte, i.e. the first byte of the service
+/// data. See <https://bthome.io/format/>.
+struct BthomeDeviceInfo {
+    /// Bits 5-7. This decoder only understands version 2.
+    version: u8,
+    /// Bit 0. When set, everything after this byte is ciphertext.
+    encrypted: bool,
+}
 
         BlePacketType::Other => {
             // Every phone, watch and TV in range lands here. Now that each
@@ -107,8 +135,45 @@ pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) -> Option<SensorData> 
             // device, saying so on every packet drowns out the readings.
         }
     }
+}
 
-    None
+/// Number of value bytes that follow a BTHome object id, or `None` if the
+/// length cannot be determined.
+///
+/// This is what keeps the parser in sync: an object we do not interpret still
+/// has to be skipped by exactly the right number of bytes, otherwise the next
+/// value byte gets read as an object id. Lengths are from
+/// <https://bthome.io/format/>. `tail` is the payload after the object id and
+/// is only needed for the few variable-length objects.
+fn bthome_value_len(object_id: u8, tail: &[u8]) -> Option<usize> {
+    let len = match object_id {
+        // 1-byte sensor values: packet id, battery, count, humidity, moisture,
+        // UV index, temperature, channel, light level, settings revision.
+        0x00 | 0x01 | 0x09 | 0x2E | 0x2F | 0x46 | 0x57 | 0x58 | 0x59 | 0x60 | 0x64 | 0x65 => 1,
+        // 2-byte sensor values.
+        0x02 | 0x03 | 0x06 | 0x07 | 0x08 | 0x0C | 0x0D | 0x0E | 0x12 | 0x13 | 0x14 | 0x40
+        | 0x41 | 0x43 | 0x44 | 0x45 | 0x47 | 0x48 | 0x49 | 0x4A | 0x51 | 0x52 | 0x56 | 0x5A
+        | 0x5D | 0x5E | 0x5F | 0x61 => 2,
+        // 3-byte sensor values: pressure, illuminance, energy, power, duration, gas.
+        0x04 | 0x05 | 0x0A | 0x0B | 0x42 | 0x4B => 3,
+        // 4-byte sensor values.
+        0x4C | 0x4D | 0x4E | 0x4F | 0x50 | 0x55 | 0x5B | 0x5C | 0x62 | 0x63 => 4,
+        // Binary sensors and the button event are one byte each.
+        0x0F..=0x11 | 0x15..=0x2D | 0x3A => 1,
+        // Command and dimmer events carry a step count for some event types.
+        0x3B => match *tail.first()? {
+            0x03 | 0x04 => 2,
+            _ => 1,
+        },
+        0x3C => match *tail.first()? {
+            0x01 | 0x02 => 2,
+            _ => 1,
+        },
+        // Text and raw are length-prefixed.
+        0x53 | 0x54 => 1 + usize::from(*tail.first()?),
+        _ => return None,
+    };
+    Some(len)
 }
 
 // --- BTHome Decoder ---
@@ -250,7 +315,7 @@ fn decode_bthome(payload: &[u8]) -> Option<SensorData> {
 }
 
 // --- PVVX Decoder ---
-fn decode_pvvx(payload: &Vec<u8>) -> Option<SensorData> {
+fn decode_pvvx(payload: &[u8]) -> Option<SensorData> {
     const MIN_LENGTH: usize = 15;
     const MAC_LENGTH: usize = 6;
 
@@ -294,6 +359,7 @@ fn decode_pvvx(payload: &Vec<u8>) -> Option<SensorData> {
     };
 
     Some(SensorData {
+        format: SensorFormat::Pvvx,
         temperature,
         humidity,
         battery,

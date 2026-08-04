@@ -1,0 +1,31 @@
+# Example configuration for mitempr. Pass it with --config /etc/mitempr.toml.
+#
+# Everything here is optional: without a configuration file mitempr reports
+# every sensor it can decode, using whatever name the device advertises.
+
+[general]
+# Report only the sensors listed below and ignore every other device. Useful in
+# a block of flats where the neighbours' thermometers are in range too.
+# Also saves a D-Bus round-trip per ignored advertisement.
+only_known = true
+
+# Ignore advertisements weaker than this, in dBm. A reading from a sensor at the
+# edge of range is often a garbled one. Advertisements whose RSSI BlueZ does not
+# report are always accepted.
+min_rssi = -90
+
+[[sensor]]
+mac = "A4:C1:38:00:11:22"
+name = "Living Room"
+# Added to every reading from this sensor, to line it up with a reference
+# thermometer. Both default to 0.
+temperature_offset = -0.3
+humidity_offset = 1.5
+
+[[sensor]]
+mac = "A4:C1:38:AA:BB:CC"
+name = "Balcony"
+
+# A sensor needs nothing but its MAC address to be "known".
+[[sensor]]
+mac = "58:2D:34:11:22:33"
