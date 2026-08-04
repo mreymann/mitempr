@@ -83,7 +83,9 @@ pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) -> Option<SensorData> 
         }
 
         BlePacketType::Other => {
-            println!("  -> Unknown BLE packet");
+            // Every phone, watch and TV in range lands here. Now that each
+            // advertisement is processed rather than only the first one per
+            // device, saying so on every packet drowns out the readings.
         }
     }
 
