@@ -1,6 +1,20 @@
+use crate::crypto::{self, BindKey};
 use std::collections::HashMap;
 use std::fmt;
 use uuid::Uuid;
+
+/// What the decoders need besides the service data itself.
+///
+/// The MAC is part of the nonce for both encrypted formats, and the bind key is
+/// what makes decrypting possible at all. Both default to "absent", which is the
+/// unencrypted case.
+#[derive(Clone, Copy, Default)]
+pub struct DecodeOptions<'a> {
+    /// The sender's address, in the order it is printed.
+    pub mac: [u8; 6],
+    /// This sensor's bind key, if one is configured.
+    pub bindkey: Option<&'a BindKey>,
+}
 
 /// The advertisement format a sensor is broadcasting in.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -91,17 +105,20 @@ fn get_packet_type(service_data: &HashMap<Uuid, Vec<u8>>) -> (SensorFormat, Opti
 /// Decode failures are logged at debug level, not warn: a sensor broadcasts
 /// several times a minute, so a payload this tool cannot read would otherwise
 /// repeat the same warning forever.
-pub fn handle_service_data(data: &HashMap<Uuid, Vec<u8>>) -> Option<SensorData> {
+pub fn handle_service_data(
+    data: &HashMap<Uuid, Vec<u8>>,
+    options: DecodeOptions<'_>,
+) -> Option<SensorData> {
     let (format, payload) = get_packet_type(data);
     let payload = payload?;
 
     match format {
-        SensorFormat::MiBeacon => match decode_mijia(payload) {
+        SensorFormat::MiBeacon => match decode_mijia(payload, options) {
             Ok(decoded) => return Some(decoded),
             Err(e) => log::debug!("could not decode MiBeacon payload: {e}"),
         },
 
-        SensorFormat::BtHome => match decode_bthome(payload) {
+        SensorFormat::BtHome => match decode_bthome(payload, options) {
             Some(decoded) => return Some(decoded),
             None => log::debug!("could not decode BTHome payload"),
         },
@@ -240,8 +257,8 @@ fn u24_le(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0])
 }
 
-fn decode_bthome(payload: &[u8]) -> Option<SensorData> {
-    let (&info_byte, mut rest) = payload.split_first()?;
+fn decode_bthome(payload: &[u8], options: DecodeOptions<'_>) -> Option<SensorData> {
+    let (&info_byte, plaintext) = payload.split_first()?;
     let info = BthomeDeviceInfo::parse(info_byte);
 
     if info.version != 2 {
@@ -405,18 +422,12 @@ const MIBEACON_MAC_LEN: usize = 6;
 /// Bit 5 of the capability byte announces an extra IO-capability byte.
 const MIBEACON_CAPABILITY_IO: u8 = 0x20;
 
-fn decode_mijia(payload: &[u8]) -> Result<SensorData, String> {
+fn decode_mijia(payload: &[u8], options: DecodeOptions<'_>) -> Result<SensorData, String> {
     if payload.len() < MIBEACON_HEADER_LEN {
         return Err(format!("MiBeacon frame too short: {} bytes", payload.len()));
     }
 
     let frame_control = MibeaconFrameControl::parse([payload[0], payload[1]]);
-
-    if frame_control.encrypted {
-        // The objects are ciphertext. Parsing them as plaintext produces
-        // believable-looking rubbish, so refuse rather than invent readings.
-        return Err("frame is encrypted and no bind key is configured".to_string());
-    }
 
     if !frame_control.object_included {
         return Err("frame carries no data object".to_string());
@@ -441,9 +452,23 @@ fn decode_mijia(payload: &[u8]) -> Result<SensorData, String> {
         }
     }
 
-    let mut objects = payload
-        .get(offset..)
-        .ok_or("frame ends before the first data object")?;
+    // Held so that `objects` can borrow from it for the rest of the function.
+    let decrypted;
+    let mut objects = if frame_control.encrypted {
+        // The objects are ciphertext. Parsing them as plaintext produces
+        // believable-looking rubbish, so refuse rather than invent readings.
+        let key = options
+            .bindkey
+            .ok_or("frame is encrypted and no bind key is configured")?;
+
+        decrypted = crypto::decrypt_mibeacon(payload, offset, options.mac, key)
+            .map_err(|e| format!("could not decrypt frame: {e}"))?;
+        decrypted.as_slice()
+    } else {
+        payload
+            .get(offset..)
+            .ok_or("frame ends before the first data object")?
+    };
 
     let mut result = SensorData::default();
 
@@ -543,7 +568,8 @@ mod tests {
             ],
         );
 
-        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("BTHome payload should decode");
         assert_eq!(reading.battery, Some(100));
         assert_measurement(reading.temperature, 24.29);
         assert_measurement(reading.humidity, 62.85);
@@ -555,7 +581,8 @@ mod tests {
     fn bthome_decodes_voltage() {
         let data = advertisement(BTHOME_UUID, &[0x40, 0x00, 0x01, 0x0C, 0x9E, 0x0B]);
 
-        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("BTHome payload should decode");
         assert_measurement(reading.voltage, 2.974);
         assert_eq!(reading.temperature, None);
         assert_eq!(reading.humidity, None);
@@ -576,7 +603,8 @@ mod tests {
             &[0x40, 0x05, 0xE8, 0x03, 0x00, 0x02, 0x7D, 0x09],
         );
 
-        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("BTHome payload should decode");
         assert_measurement(reading.illuminance, 10.00);
         assert_measurement(reading.temperature, 24.29);
         assert_eq!(
@@ -590,7 +618,8 @@ mod tests {
     fn bthome_decodes_pressure() {
         let data = advertisement(BTHOME_UUID, &[0x40, 0x04, 0xCD, 0x8B, 0x01]);
 
-        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("BTHome payload should decode");
         assert_measurement(reading.pressure, 1013.25);
     }
 
@@ -599,7 +628,8 @@ mod tests {
     fn bthome_decodes_single_byte_humidity_and_moisture() {
         let data = advertisement(BTHOME_UUID, &[0x40, 0x2E, 0x33, 0x2F, 0x22]);
 
-        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("BTHome payload should decode");
         assert_measurement(reading.humidity, 51.0);
         assert_measurement(reading.moisture, 34.0);
     }
@@ -609,7 +639,8 @@ mod tests {
     fn bthome_decodes_low_resolution_temperature() {
         let data = advertisement(BTHOME_UUID, &[0x40, 0x45, 0xEA, 0x00]);
 
-        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("BTHome payload should decode");
         assert_measurement(reading.temperature, 23.4);
     }
 
@@ -623,7 +654,8 @@ mod tests {
             &[0x40, 0x02, 0x7D, 0x09, 0x12, 0xE8, 0x03, 0x03, 0x8D, 0x18],
         );
 
-        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("BTHome payload should decode");
         assert_measurement(reading.temperature, 24.29);
         assert_measurement(reading.humidity, 62.85);
     }
@@ -637,7 +669,8 @@ mod tests {
             &[0x40, 0x02, 0x7D, 0x09, 0xF0, 0xAA, 0xBB, 0x03, 0x8D, 0x18],
         );
 
-        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("BTHome payload should decode");
         assert_measurement(reading.temperature, 24.29);
         assert_eq!(
             reading.humidity, None,
@@ -651,7 +684,8 @@ mod tests {
     fn bthome_ignores_a_truncated_object() {
         let data = advertisement(BTHOME_UUID, &[0x40, 0x02, 0x7D, 0x09, 0x03, 0x8D]);
 
-        let reading = handle_service_data(&data).expect("BTHome payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("BTHome payload should decode");
         assert_measurement(reading.temperature, 24.29);
         assert_eq!(reading.humidity, None);
     }
@@ -662,7 +696,7 @@ mod tests {
     fn bthome_rejects_a_non_v2_payload() {
         let data = advertisement(BTHOME_UUID, &[0x20, 0x02, 0x7D, 0x09]);
 
-        assert!(handle_service_data(&data).is_none());
+        assert!(handle_service_data(&data, DecodeOptions::default()).is_none());
     }
 
     /// A payload with nothing but a device-info byte carries no measurement.
@@ -670,7 +704,7 @@ mod tests {
     fn bthome_rejects_a_payload_without_objects() {
         let data = advertisement(BTHOME_UUID, &[0x40]);
 
-        assert!(handle_service_data(&data).is_none());
+        assert!(handle_service_data(&data, DecodeOptions::default()).is_none());
     }
 
     /// Device info 0x41 sets bit 0, marking the payload as encrypted. Without a
@@ -690,7 +724,7 @@ mod tests {
         );
 
         assert!(
-            handle_service_data(&data).is_none(),
+            handle_service_data(&data, DecodeOptions::default()).is_none(),
             "an encrypted payload must not yield a plaintext reading"
         );
     }
@@ -710,7 +744,8 @@ mod tests {
             ],
         );
 
-        let reading = handle_service_data(&data).expect("PVVX payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("PVVX payload should decode");
         assert_measurement(reading.temperature, 22.90);
         assert_measurement(reading.humidity, 64.25);
         assert_measurement(reading.voltage, 2.333);
@@ -728,7 +763,8 @@ mod tests {
             ],
         );
 
-        let reading = handle_service_data(&data).expect("PVVX payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("PVVX payload should decode");
         assert_measurement(reading.temperature, -1.00);
     }
 
@@ -743,7 +779,7 @@ mod tests {
             ],
         );
 
-        assert!(handle_service_data(&data).is_none());
+        assert!(handle_service_data(&data, DecodeOptions::default()).is_none());
     }
 
     // --- Xiaomi MiBeacon / LYWSDCGQ ---
@@ -761,7 +797,8 @@ mod tests {
             ],
         );
 
-        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("MiBeacon payload should decode");
         assert_measurement(reading.temperature, 23.4);
         assert_measurement(reading.humidity, 60.9);
         assert_eq!(reading.battery, None);
@@ -779,7 +816,8 @@ mod tests {
             ],
         );
 
-        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("MiBeacon payload should decode");
         assert_measurement(reading.temperature, 23.4);
         assert_eq!(reading.humidity, None);
     }
@@ -795,7 +833,8 @@ mod tests {
             ],
         );
 
-        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("MiBeacon payload should decode");
         assert_measurement(reading.humidity, 60.9);
         assert_eq!(reading.temperature, None);
     }
@@ -811,7 +850,8 @@ mod tests {
             ],
         );
 
-        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("MiBeacon payload should decode");
         assert_eq!(reading.battery, Some(91));
         assert_eq!(reading.temperature, None);
         assert_eq!(reading.humidity, None);
@@ -827,7 +867,7 @@ mod tests {
             ],
         );
 
-        assert!(handle_service_data(&data).is_none());
+        assert!(handle_service_data(&data, DecodeOptions::default()).is_none());
     }
 
     /// An event id this decoder does not know is reported as undecodable rather
@@ -842,7 +882,7 @@ mod tests {
             ],
         );
 
-        assert!(handle_service_data(&data).is_none());
+        assert!(handle_service_data(&data, DecodeOptions::default()).is_none());
     }
 
     /// Frame control 0x2070 additionally sets bit 5, so a capability byte (0x08,
@@ -863,7 +903,8 @@ mod tests {
             ],
         );
 
-        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("MiBeacon payload should decode");
         assert_measurement(reading.temperature, 23.4);
         assert_measurement(reading.humidity, 60.9);
     }
@@ -879,7 +920,8 @@ mod tests {
             ],
         );
 
-        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("MiBeacon payload should decode");
         assert_measurement(reading.temperature, 23.4);
         assert_measurement(reading.humidity, 60.9);
     }
@@ -897,7 +939,7 @@ mod tests {
         );
 
         assert!(
-            handle_service_data(&data).is_none(),
+            handle_service_data(&data, DecodeOptions::default()).is_none(),
             "an encrypted payload must not yield a plaintext reading"
         );
     }
@@ -914,7 +956,8 @@ mod tests {
             ],
         );
 
-        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("MiBeacon payload should decode");
         assert_measurement(reading.temperature, 23.4);
         assert_measurement(reading.humidity, 60.9);
     }
@@ -931,7 +974,7 @@ mod tests {
             ],
         );
 
-        assert!(handle_service_data(&data).is_none());
+        assert!(handle_service_data(&data, DecodeOptions::default()).is_none());
     }
 
     /// A frame may carry several objects in a row. Here a battery event is
@@ -946,7 +989,8 @@ mod tests {
             ],
         );
 
-        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("MiBeacon payload should decode");
         assert_eq!(reading.battery, Some(91));
         assert_measurement(reading.temperature, 23.4);
         assert_measurement(reading.humidity, 60.9);
@@ -965,7 +1009,8 @@ mod tests {
             ],
         );
 
-        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("MiBeacon payload should decode");
         assert_measurement(reading.temperature, 23.4);
         assert_measurement(reading.humidity, 60.9);
     }
@@ -982,7 +1027,7 @@ mod tests {
             ],
         );
 
-        assert!(handle_service_data(&data).is_none());
+        assert!(handle_service_data(&data, DecodeOptions::default()).is_none());
     }
 
     /// Illuminance event 0x1007: 0x0001F4 = 500 lux.
@@ -996,7 +1041,8 @@ mod tests {
             ],
         );
 
-        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("MiBeacon payload should decode");
         assert_measurement(reading.illuminance, 500.0);
     }
 
@@ -1011,8 +1057,99 @@ mod tests {
             ],
         );
 
-        let reading = handle_service_data(&data).expect("MiBeacon payload should decode");
+        let reading = handle_service_data(&data, DecodeOptions::default())
+            .expect("MiBeacon payload should decode");
         assert_measurement(reading.moisture, 28.0);
+    }
+
+    // --- Encrypted payloads ---
+
+    const BINDKEY: BindKey = [
+        0x23, 0x1D, 0x39, 0xC1, 0xD7, 0xCC, 0x1A, 0xB1, 0xAE, 0xE2, 0x24, 0xCD, 0x09, 0x6D, 0xB9,
+        0x32,
+    ];
+    const SENDER: [u8; 6] = [0xA4, 0xC1, 0x38, 0xA0, 0x7B, 0x03];
+
+    /// The whole path for an encrypted sensor: decrypt, then parse the objects
+    /// that come out. Same measurements as the unencrypted BTHome fixture.
+    #[test]
+    fn an_encrypted_bthome_payload_is_decoded_with_its_bindkey() {
+        let payload = crypto::seal_bthome(
+            &[0x01, 0x64, 0x02, 0x7D, 0x09, 0x03, 0x8D, 0x18],
+            0x41, // v2, encrypted
+            [0x08, 0x00, 0x00, 0x00],
+            SENDER,
+            &BINDKEY,
+        );
+        let data = advertisement(BTHOME_UUID, &payload);
+
+        let reading = handle_service_data(
+            &data,
+            DecodeOptions {
+                mac: SENDER,
+                bindkey: Some(&BINDKEY),
+            },
+        )
+        .expect("an encrypted payload should decode with its bind key");
+
+        assert_eq!(reading.battery, Some(100));
+        assert_measurement(reading.temperature, 24.29);
+        assert_measurement(reading.humidity, 62.85);
+    }
+
+    #[test]
+    fn an_encrypted_bthome_payload_with_the_wrong_bindkey_yields_nothing() {
+        let payload = crypto::seal_bthome(
+            &[0x02, 0x7D, 0x09],
+            0x41,
+            [0x08, 0x00, 0x00, 0x00],
+            SENDER,
+            &BINDKEY,
+        );
+        let data = advertisement(BTHOME_UUID, &payload);
+
+        let mut wrong = BINDKEY;
+        wrong[0] ^= 0xFF;
+
+        assert!(
+            handle_service_data(
+                &data,
+                DecodeOptions {
+                    mac: SENDER,
+                    bindkey: Some(&wrong),
+                },
+            )
+            .is_none(),
+            "a failed MIC check must not produce a reading"
+        );
+    }
+
+    #[test]
+    fn an_encrypted_mibeacon_frame_is_decoded_with_its_bindkey() {
+        // Frame control 0x2058: MAC and object included, encrypted.
+        let header = [
+            0x58, 0x20, 0xAA, 0x01, 0xF5, 0x03, 0x7B, 0xA0, 0x38, 0xC1, 0xA4,
+        ];
+        let payload = crypto::seal_mibeacon(
+            &[0x0D, 0x10, 0x04, 0xEA, 0x00, 0x61, 0x02],
+            &header,
+            [0x0A, 0x00, 0x00],
+            SENDER,
+            &BINDKEY,
+        );
+        let data = advertisement(MIJIA_UUID, &payload);
+
+        let reading = handle_service_data(
+            &data,
+            DecodeOptions {
+                mac: SENDER,
+                bindkey: Some(&BINDKEY),
+            },
+        )
+        .expect("an encrypted frame should decode with its bind key");
+
+        assert_measurement(reading.temperature, 23.4);
+        assert_measurement(reading.humidity, 60.9);
     }
 
     // --- Dispatch ---
@@ -1025,12 +1162,12 @@ mod tests {
             &[0x64, 0x00, 0x00],
         );
 
-        assert!(handle_service_data(&data).is_none());
+        assert!(handle_service_data(&data, DecodeOptions::default()).is_none());
     }
 
     /// An advertisement with no service data at all is ignored.
     #[test]
     fn empty_service_data_is_ignored() {
-        assert!(handle_service_data(&HashMap::new()).is_none());
+        assert!(handle_service_data(&HashMap::new(), DecodeOptions::default()).is_none());
     }
 }

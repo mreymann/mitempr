@@ -1,6 +1,7 @@
 //! Optional TOML configuration: naming sensors, calibrating them and ignoring
 //! everything else.
 
+use crate::crypto::{self, BindKey};
 use crate::decoder::SensorData;
 use bluer::Address;
 use serde::Deserialize;
@@ -40,6 +41,8 @@ struct SensorEntry {
     /// Added to every humidity reading from this sensor, in percent.
     #[serde(default)]
     humidity_offset: f32,
+    /// 32 hex characters, for sensors that encrypt their advertisements.
+    bindkey: Option<String>,
 }
 
 /// What is known about one configured sensor.
@@ -48,6 +51,8 @@ pub struct SensorSettings {
     pub name: Option<String>,
     pub temperature_offset: f32,
     pub humidity_offset: f32,
+    /// Key for decrypting this sensor's advertisements, if it encrypts them.
+    pub bindkey: Option<BindKey>,
 }
 
 impl SensorSettings {
@@ -86,10 +91,21 @@ impl Config {
         let mut sensors = HashMap::with_capacity(file.sensors.len());
         for entry in file.sensors {
             let address = parse_address(&entry.mac)?;
+            let bindkey = entry
+                .bindkey
+                .as_deref()
+                .map(crypto::parse_bindkey)
+                .transpose()
+                .map_err(|reason| ConfigError::InvalidBindKey {
+                    mac: entry.mac.clone(),
+                    reason,
+                })?;
+
             let settings = SensorSettings {
                 name: entry.name,
                 temperature_offset: entry.temperature_offset,
                 humidity_offset: entry.humidity_offset,
+                bindkey,
             };
             if sensors.insert(address, settings).is_some() {
                 return Err(ConfigError::DuplicateSensor(entry.mac));
@@ -175,6 +191,10 @@ pub enum ConfigError {
     },
     InvalidAddress(String),
     DuplicateSensor(String),
+    InvalidBindKey {
+        mac: String,
+        reason: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -186,6 +206,9 @@ impl fmt::Display for ConfigError {
                 write!(f, "{value:?} is not a MAC address like A4:C1:38:00:11:22")
             }
             Self::DuplicateSensor(value) => write!(f, "{value} is configured more than once"),
+            Self::InvalidBindKey { mac, reason } => {
+                write!(f, "the bind key for {mac} is unusable: {reason}")
+            }
         }
     }
 }
@@ -195,7 +218,9 @@ impl std::error::Error for ConfigError {
         match self {
             Self::Read { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
-            Self::InvalidAddress(_) | Self::DuplicateSensor(_) => None,
+            Self::InvalidAddress(_) | Self::DuplicateSensor(_) | Self::InvalidBindKey { .. } => {
+                None
+            }
         }
     }
 }
@@ -334,9 +359,9 @@ mod tests {
     #[test]
     fn calibration_offsets_are_added_to_the_reading() {
         let settings = SensorSettings {
-            name: None,
             temperature_offset: -0.3,
             humidity_offset: 1.5,
+            ..Default::default()
         };
         let mut data = SensorData {
             temperature: Some(22.90),
@@ -359,9 +384,9 @@ mod tests {
     #[test]
     fn calibration_leaves_absent_measurements_absent() {
         let settings = SensorSettings {
-            name: None,
             temperature_offset: -0.3,
             humidity_offset: 1.5,
+            ..Default::default()
         };
         let mut data = SensorData::default();
 

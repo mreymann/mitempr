@@ -9,11 +9,13 @@ use tokio::time::sleep;
 use uuid::Uuid;
 mod decoder;
 mod exec;
+mod metrics;
 mod output;
 mod scan;
 
 use config::Config;
 use exec::Hook;
+use metrics::{PushTarget, Registry};
 use output::Format;
 
 /// Read environmental data from Bluetooth sensors.
@@ -40,6 +42,24 @@ struct Args {
     /// Shortest gap in seconds between two --exec runs for the same sensor
     #[arg(long, value_name = "SECS", default_value_t = 0, requires = "exec")]
     exec_interval: u64,
+
+    /// Serve Prometheus metrics on this address, e.g. 0.0.0.0:9184
+    #[arg(long, value_name = "ADDR")]
+    metrics_addr: Option<SocketAddr>,
+
+    /// Also push the same metrics to a Prometheus Pushgateway, e.g.
+    /// http://gateway:9091 (plain HTTP only)
+    #[arg(long, value_name = "URL")]
+    pushgateway_url: Option<String>,
+
+    /// How often to push to the Pushgateway, in seconds
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = 30,
+        requires = "pushgateway_url"
+    )]
+    push_interval: u64,
 
     /// Restart discovery if no reading arrives for this many seconds
     #[arg(long, default_value_t = 20)]

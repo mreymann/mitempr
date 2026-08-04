@@ -19,6 +19,7 @@ Strongly inspired by [Mitemperature2](https://github.com/JsBergbau/MiTemperature
 ```
 mitempr [--config PATH] [--only-known] [--min-rssi DBM]
         [--exec PATH] [--exec-interval SECS]
+        [--metrics-addr ADDR] [--pushgateway-url URL] [--push-interval SECS]
         [--format text|json] [-v|-vv] [-q]
         [--watchdog SECS] [--cooldown SECS]
 ```
@@ -63,6 +64,7 @@ mac = "A4:C1:38:00:11:22"
 name = "Living Room"
 temperature_offset = -0.3   # added to every reading from this sensor
 humidity_offset = 1.5
+bindkey = "231d..."         # only for sensors that encrypt (see below)
 ```
 
 A configured `name` replaces the advertised one, so readings are labelled the
@@ -102,10 +104,65 @@ warning — a backlog of stale temperatures is worse than a gap.
 The script's stdout goes to `/dev/null` so a chatty script cannot corrupt
 `--format json`; its stderr is left alone so you can see it complain.
 
+## Prometheus
+
+Two ways to get the readings into Prometheus.
+
+**Scraping** (`--metrics-addr 0.0.0.0:9184`) serves `/metrics`:
+
+```console
+$ curl -s localhost:9184/metrics
+# HELP mitempr_temperature_celsius Last temperature reported by the sensor, in degrees Celsius.
+# TYPE mitempr_temperature_celsius gauge
+mitempr_temperature_celsius{mac="A4:C1:38:A0:7B:03",name="Living Room",format="pvvx"} 22.5
+```
+
+Exported per sensor: `mitempr_temperature_celsius`, `mitempr_humidity_percent`,
+`mitempr_pressure_hpa`, `mitempr_illuminance_lux`, `mitempr_moisture_percent`,
+`mitempr_battery_percent`, `mitempr_battery_volts`, `mitempr_rssi_dbm`,
+`mitempr_last_seen_timestamp_seconds` and the counter
+`mitempr_readings_total`. Only measurements a sensor actually reports get a
+series.
+
+A gauge keeps its last value, so use `mitempr_last_seen_timestamp_seconds` to
+tell a quiet sensor from a fresh one:
+
+```promql
+time() - mitempr_last_seen_timestamp_seconds > 600
+```
+
+**Pushing** (`--pushgateway-url http://gateway:9091`) POSTs the same text every
+`--push-interval` seconds (30 by default), which is what you want when the Pi
+cannot be reached from the Prometheus server. The URL defaults to job
+`mitempr`; spell out the path (`http://gateway:9091/metrics/job/attic`) to
+choose the job name or add grouping labels. Plain HTTP only — there is no TLS
+client here, so put a reverse proxy in front of it or use scraping instead. A
+Pushgateway that is down is logged and retried, never fatal.
+
+## Encrypted sensors
+
+BTHome v2 and MiBeacon can both encrypt their advertisements with AES-CCM and a
+per-device bind key. Give the key in the sensor's config block and the
+advertisement is decrypted before it is decoded:
+
+```toml
+[[sensor]]
+mac = "A4:C1:38:00:11:22"
+bindkey = "231d39c1d7cc1ab1aee224cd096db932"
+```
+
+The key is 32 hex characters. BTHome devices print theirs when you set one;
+Xiaomi keys come out of the Mi Home account, which is what tools like
+[Xiaomi-cloud-tokens-extractor](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor)
+are for.
+
+Without a key an encrypted advertisement is skipped with a message rather than
+parsed as if it were plaintext — ciphertext read as plaintext produces
+believable-looking nonsense. A wrong key fails the packet's MIC check, which is
+also reported rather than guessed at.
+
 ## TODOs
 
- - also decode **encrypted** data
- - URL callback to Prometheus Push Gateway
  - and many more things to fiddle with ;-)
 
 ## Cross compiling
