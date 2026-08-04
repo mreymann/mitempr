@@ -11,7 +11,14 @@ categories = ["command-line-utilities", "embedded"]
 [dependencies]
 # Only the runtime pieces actually used. "full" additionally pulls in fs, net,
 # process and io-util, which cost compile time and binary size.
-tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "1.48", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "signal",
+    "process",
+] }
 uuid = "1.4"
 libdbus-sys = { version = "0.2", features = ["vendored"] } # "vendored" is needed for cross compilation!
 # "bluetoothd" is the D-Bus client API this tool uses; "full" would also build

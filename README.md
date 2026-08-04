@@ -18,6 +18,7 @@ Strongly inspired by [Mitemperature2](https://github.com/JsBergbau/MiTemperature
 
 ```
 mitempr [--config PATH] [--only-known] [--min-rssi DBM]
+        [--exec PATH] [--exec-interval SECS]
         [--format text|json] [-v|-vv] [-q]
         [--watchdog SECS] [--cooldown SECS]
 ```
@@ -73,11 +74,38 @@ nothing but the event.
 Unknown keys are rejected rather than ignored, so a typo like `temp_offset`
 tells you about itself instead of silently doing nothing.
 
+## Calling an external script
+
+`--exec /path/to/script` runs a program once per reading. The reading arrives
+twice, so the script can use whichever is more convenient: as `MITEMPR_*`
+environment variables, and as one JSON object on standard input.
+
+```sh
+#!/bin/sh
+# Every variable is always set; an empty one means the sensor did not report it.
+[ -n "$MITEMPR_TEMPERATURE" ] || exit 0
+echo "$MITEMPR_NAME is at ${MITEMPR_TEMPERATURE} C"
+```
+
+Available: `MITEMPR_MAC`, `MITEMPR_NAME`, `MITEMPR_FORMAT`,
+`MITEMPR_TIMESTAMP`, `MITEMPR_RSSI`, `MITEMPR_TEMPERATURE`,
+`MITEMPR_HUMIDITY`, `MITEMPR_BATTERY`, `MITEMPR_VOLTAGE`, `MITEMPR_PRESSURE`,
+`MITEMPR_ILLUMINANCE`, `MITEMPR_MOISTURE`.
+
+Sensors advertise every second or two, which is usually more often than you want
+to call out to something: `--exec-interval 60` runs the script at most once a
+minute per sensor. At most four hooks run at once and one that has not finished
+in 30 seconds is killed, so a slow script cannot pile up processes on a Pi Zero.
+When the hook cannot keep up its readings are dropped rather than queued, with a
+warning — a backlog of stale temperatures is worse than a gap.
+
+The script's stdout goes to `/dev/null` so a chatty script cannot corrupt
+`--format json`; its stderr is left alone so you can see it complain.
+
 ## TODOs
 
  - also decode **encrypted** data
  - URL callback to Prometheus Push Gateway
- - call external scripts
  - and many more things to fiddle with ;-)
 
 ## Cross compiling
