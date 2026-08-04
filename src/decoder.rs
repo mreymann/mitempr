@@ -146,6 +146,64 @@ struct BthomeDeviceInfo {
     encrypted: bool,
 }
 
+        BlePacketType::Other => {
+            // Every phone, watch and TV in range lands here. Now that each
+            // advertisement is processed rather than only the first one per
+            // device, saying so on every packet drowns out the readings.
+        }
+    }
+}
+
+/// Number of value bytes that follow a BTHome object id, or `None` if the
+/// length cannot be determined.
+///
+/// This is what keeps the parser in sync: an object we do not interpret still
+/// has to be skipped by exactly the right number of bytes, otherwise the next
+/// value byte gets read as an object id. Lengths are from
+/// <https://bthome.io/format/>. `tail` is the payload after the object id and
+/// is only needed for the few variable-length objects.
+fn bthome_value_len(object_id: u8, tail: &[u8]) -> Option<usize> {
+    let len = match object_id {
+        // 1-byte sensor values: packet id, battery, count, humidity, moisture,
+        // UV index, temperature, channel, light level, settings revision.
+        0x00 | 0x01 | 0x09 | 0x2E | 0x2F | 0x46 | 0x57 | 0x58 | 0x59 | 0x60 | 0x64 | 0x65 => 1,
+        // 2-byte sensor values.
+        0x02 | 0x03 | 0x06 | 0x07 | 0x08 | 0x0C | 0x0D | 0x0E | 0x12 | 0x13 | 0x14 | 0x40
+        | 0x41 | 0x43 | 0x44 | 0x45 | 0x47 | 0x48 | 0x49 | 0x4A | 0x51 | 0x52 | 0x56 | 0x5A
+        | 0x5D | 0x5E | 0x5F | 0x61 => 2,
+        // 3-byte sensor values: pressure, illuminance, energy, power, duration, gas.
+        0x04 | 0x05 | 0x0A | 0x0B | 0x42 | 0x4B => 3,
+        // 4-byte sensor values.
+        0x4C | 0x4D | 0x4E | 0x4F | 0x50 | 0x55 | 0x5B | 0x5C | 0x62 | 0x63 => 4,
+        // Binary sensors and the button event are one byte each.
+        0x0F..=0x11 | 0x15..=0x2D | 0x3A => 1,
+        // Command and dimmer events carry a step count for some event types.
+        0x3B => match *tail.first()? {
+            0x03 | 0x04 => 2,
+            _ => 1,
+        },
+        0x3C => match *tail.first()? {
+            0x01 | 0x02 => 2,
+            _ => 1,
+        },
+        // Text and raw are length-prefixed.
+        0x53 | 0x54 => 1 + usize::from(*tail.first()?),
+        _ => return None,
+    };
+    Some(len)
+}
+
+// --- BTHome Decoder ---
+
+/// The BTHome v2 device-information byte, i.e. the first byte of the service
+/// data. See <https://bthome.io/format/>.
+struct BthomeDeviceInfo {
+    /// Bits 5-7. This decoder only understands version 2.
+    version: u8,
+    /// Bit 0. When set, everything after this byte is ciphertext.
+    encrypted: bool,
+}
+
 impl BthomeDeviceInfo {
     fn parse(byte: u8) -> Self {
         Self {
@@ -204,52 +262,33 @@ fn decode_bthome(payload: &[u8], options: DecodeOptions<'_>) -> Option<SensorDat
     let info = BthomeDeviceInfo::parse(info_byte);
 
     if info.version != 2 {
-        log::debug!(
-            "BTHome v{} is not supported (device info 0x{info_byte:02X})",
+        println!(
+            "  [!] BTHome v{} is not supported (device info 0x{info_byte:02X})",
             info.version
         );
         return None;
     }
 
-    // Held so that `rest` can borrow from it for the rest of the function.
-    let decrypted;
-    let mut rest = if info.encrypted {
-        let Some(key) = options.bindkey else {
-            // Reading the ciphertext as if it were objects yields
-            // plausible-looking nonsense, so refuse instead of inventing
-            // measurements.
-            log::debug!("BTHome payload is encrypted and no bind key is configured");
-            return None;
-        };
+    if info.encrypted {
+        // Reading the ciphertext as if it were objects yields plausible-looking
+        // nonsense, so refuse instead of inventing measurements.
+        println!("  [!] BTHome payload is encrypted and no bind key is configured");
+        return None;
+    }
 
-        decrypted = match crypto::decrypt_bthome(payload, options.mac, key) {
-            Ok(plaintext) => plaintext,
-            Err(e) => {
-                log::warn!("could not decrypt BTHome payload: {e}");
-                return None;
-            }
-        };
-        decrypted.as_slice()
-    } else {
-        plaintext
-    };
-
-    let mut result = SensorData {
-        format: SensorFormat::BtHome,
-        ..Default::default()
-    };
+    let mut result = SensorData::default();
 
     while let Some((&object_id, tail)) = rest.split_first() {
         let Some(len) = bthome_value_len(object_id, tail) else {
-            log::debug!(
-                "unknown BTHome object id 0x{object_id:02X}; stopping here rather than guessing \
-                 its length"
+            println!(
+                "  [!] Unknown BTHome object id 0x{object_id:02X}; stopping here rather than \
+                 guessing its length"
             );
             break;
         };
 
         if tail.len() < len {
-            log::debug!("truncated BTHome object 0x{object_id:02X}");
+            println!("  [!] Truncated BTHome object 0x{object_id:02X}");
             break;
         }
 
@@ -431,10 +470,7 @@ fn decode_mijia(payload: &[u8], options: DecodeOptions<'_>) -> Result<SensorData
             .ok_or("frame ends before the first data object")?
     };
 
-    let mut result = SensorData {
-        format: SensorFormat::MiBeacon,
-        ..Default::default()
-    };
+    let mut result = SensorData::default();
 
     // Each object is a little-endian u16 id, a length byte, then that many value
     // bytes. Because the length is explicit, an object this decoder does not

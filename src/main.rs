@@ -1,12 +1,12 @@
+use bluer::{Adapter, AdapterEvent, Address, DeviceProperty, Result};
 use clap::Parser;
-use log::LevelFilter;
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use futures::StreamExt;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-
-mod config;
-mod crypto;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::sleep;
+use uuid::Uuid;
 mod decoder;
 mod exec;
 mod metrics;
@@ -114,6 +114,9 @@ impl Args {
     }
 }
 
+/// The service data of the advertisement last seen from a device.
+type ServiceData = HashMap<Uuid, Vec<u8>>;
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -131,86 +134,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
 
-    log::info!(
-        "scanning on {} ({} configured sensor(s){}, watchdog {}s, cooldown {}s)",
-        adapter.name(),
-        config.configured_sensors(),
-        if config.only_known() {
-            ", ignoring the rest"
-        } else {
-            ""
-        },
-        args.watchdog,
-        args.cooldown
-    );
+    // The advertisement each device last sent, so that a property change which
+    // carries no new reading (an RSSI update, say) is not reported twice.
+    let mut last_service_data: HashMap<Address, ServiceData> = HashMap::new();
+    let last_ble_packet = Arc::new(Mutex::new(Instant::now()));
+    let (tx, mut rx) = mpsc::unbounded_channel::<AdapterEvent>();
 
-    // One registry shared by the scan loop, the /metrics endpoint and the
-    // Pushgateway loop; only built when something actually wants it.
-    let registry = (args.metrics_addr.is_some() || args.pushgateway_url.is_some())
-        .then(|| Arc::new(Registry::new()));
+    //
+    // 🔄 Discovery + watchdog task
+    //
+    {
+        let adapter = adapter.clone();
+        let tx = tx.clone();
+        let last_ble_packet = last_ble_packet.clone();
+        let watchdog = args.watchdog;
+        let cooldown = args.cooldown;
 
-    if let Some(addr) = args.metrics_addr {
-        let registry = Arc::clone(
-            registry
-                .as_ref()
-                .expect("registry exists with --metrics-addr"),
-        );
         tokio::spawn(async move {
-            if let Err(e) = metrics::serve(addr, registry).await {
-                log::error!("metrics endpoint stopped: {e}");
-            }
-        });
-    }
+            let mut restart_counter: u64 = 1;
 
-    if let Some(url) = &args.pushgateway_url {
-        let target = PushTarget::parse(url)?;
-        let registry = Arc::clone(
-            registry
-                .as_ref()
-                .expect("registry exists with --pushgateway-url"),
-        );
-        let interval = Duration::from_secs(args.push_interval.max(1));
-        tokio::spawn(metrics::push_periodically(target, registry, interval));
-    }
+            loop {
+                println!("🔍 (Re)starting discovery...");
 
-    let settings = scan::Settings {
-        watchdog: Duration::from_secs(args.watchdog),
-        cooldown: Duration::from_secs(args.cooldown),
-        format: args.format,
-        config,
-        exec: args
-            .exec
-            .clone()
-            .map(|program| Hook::new(program, Duration::from_secs(args.exec_interval))),
-        metrics: registry,
-    };
+                // discover_devices_with_changes() re-emits DeviceAdded every time
+                // a device's properties change, which is what turns this into a
+                // continuous reader: discover_devices() only reports each device
+                // once, so every advertisement after the first was invisible.
+                let mut events = match adapter.discover_devices_with_changes().await {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        eprintln!("❌ Failed to start discovery: {e}");
+                        sleep(Duration::from_secs(cooldown)).await;
+                        continue;
+                    }
+                };
+
+                loop {
+                    tokio::select! {
+                        evt = events.next() => {
+                            match evt {
+                                Some(AdapterEvent::DeviceAdded(addr)) => {
+                                    let _ = tx.send(AdapterEvent::DeviceAdded(addr));
+                                }
+                                Some(AdapterEvent::DeviceRemoved(addr)) => {
+                                    let _ = tx.send(AdapterEvent::DeviceRemoved(addr));
+                                }
+                                Some(_) => {}
+                                None => {
+                                    println!("⚠️ Discovery stream ended — restarting...");
+                                    break;
+                                }
+                            }
+                        }
+
+                        _ = sleep(Duration::from_secs(5)) => {
+                            let elapsed = last_ble_packet.lock().await.elapsed();
+                            if elapsed > Duration::from_secs(watchdog) {
+                                println!(
+                                    "⏱ Watchdog: no BLE packets for {elapsed:?}, restarting discovery (count {restart_counter})..."
+                                );
+                                restart_counter += 1;
+
+                                // Drop the current stream (equivalent to disable_le_scan)
+                                drop(events);
+
+                                // Wait before restarting (equivalent to Python's 5s delay)
+                                sleep(Duration::from_secs(cooldown)).await;
+
+                                break;
+                            }
+                        }
+                    }
+                }
 
     tokio::select! {
         result = scan::run(&adapter, settings) => result?,
         () = shutdown_requested() => log::info!("shutting down"),
     }
 
-    Ok(())
-}
-
-/// Resolves once the process is asked to stop, so discovery is torn down cleanly
-/// instead of being killed mid-scan. SIGTERM matters here because that is what
-/// systemd sends.
-async fn shutdown_requested() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        match signal(SignalKind::terminate()) {
-            Ok(mut terminate) => {
-                tokio::select! {
-                    () = wait_for_ctrl_c() => {}
-                    _ = terminate.recv() => {}
+    //
+    // 📡 Event processing loop
+    //
+    while let Some(evt) = rx.recv().await {
+        match evt {
+            AdapterEvent::DeviceAdded(addr) => {
+                if let Err(e) =
+                    handle_device(&adapter, addr, &mut last_service_data, &last_ble_packet).await
+                {
+                    eprintln!("Error handling device {addr}: {e}");
                 }
             }
-            Err(e) => {
-                log::warn!("cannot listen for SIGTERM: {e}");
-                wait_for_ctrl_c().await;
+            AdapterEvent::DeviceRemoved(addr) => {
+                last_service_data.remove(&addr);
             }
         }
     }
@@ -219,10 +234,52 @@ async fn shutdown_requested() {
     wait_for_ctrl_c().await;
 }
 
-async fn wait_for_ctrl_c() {
-    if let Err(e) = tokio::signal::ctrl_c().await {
-        log::warn!("cannot listen for Ctrl-C: {e}");
-        // Never resolve, so the scan keeps running instead of exiting at once.
-        std::future::pending::<()>().await;
+async fn handle_device(
+    adapter: &Adapter,
+    addr: Address,
+    last_service_data: &mut HashMap<Address, ServiceData>,
+    last_ble_packet: &Mutex<Instant>,
+) -> Result<()> {
+    let device = adapter.device(addr)?;
+
+    // One D-Bus round-trip for every property, instead of one round-trip each for
+    // the name, the RSSI and the service data. At one advertisement per second
+    // per sensor that is the difference the Pi Zero W notices.
+    let mut name = None;
+    let mut rssi = None;
+    let mut service_data = None;
+    for property in device.all_properties().await? {
+        match property {
+            DeviceProperty::Name(value) => name = Some(value),
+            DeviceProperty::Rssi(value) => rssi = Some(value),
+            DeviceProperty::ServiceData(value) => service_data = Some(value),
+            _ => {}
+        }
     }
+
+    // No service data at all: not something this tool can read.
+    let Some(service_data) = service_data else {
+        return Ok(());
+    };
+
+    // Identical to the advertisement we already reported, so some other property
+    // changed. Sensors bump a packet counter on every broadcast, so a genuinely
+    // new reading always differs here.
+    if last_service_data.get(&addr) == Some(&service_data) {
+        return Ok(());
+    }
+
+    if let Some(decoded) = decoder::handle_service_data(&service_data) {
+        let name = name.as_deref().unwrap_or("<unknown>");
+        let rssi = rssi.map_or_else(|| "n/a".to_string(), |value| value.to_string());
+        println!("📡 {addr} ({name}), RSSI={rssi}");
+        println!("  🔍 Got sensor reading: {decoded:?}");
+
+        // ✅ Reset watchdog timer only on actual sensor readings
+        *last_ble_packet.lock().await = Instant::now();
+    }
+
+    last_service_data.insert(addr, service_data);
+
+    Ok(())
 }
