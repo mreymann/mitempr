@@ -11,3 +11,5 @@ Thumbs.db
 cross-custom-*
 Dockerfile.*
 
+# Config files
+mitempr.toml
