@@ -163,7 +163,7 @@ also reported rather than guessed at.
 
 ## TODOs
 
- - and many more things to fiddle with ;-)
+ - ... many more things to fiddle with ;-)
 
 ## Cross compiling
 
