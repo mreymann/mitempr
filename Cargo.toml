@@ -1,6 +1,6 @@
 [package]
 name = "mitempr"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Read environmental data from Bluetooth sensors (BTHome v2, PVVX, LYWSDCGQ)"
 repository = "https://github.com/mreymann/mitempr"
